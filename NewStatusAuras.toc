@@ -1,0 +1,11 @@
+## Interface: 120105,120100
+## Title: NewStatusAuras
+## Notes: PowerAuras 风格 TGA 光环，联动暴雪冷却管理器追踪增益
+## Author: 梅超風-白银之手
+## Version: 1.4.2
+## X-Interface: 120105
+## X-Game-Version: 12.1
+## X-Last-Modified: 2026-09-29
+## OptionalDeps: Blizzard_CooldownViewer
+## SavedVariables: NewStatusAurasDB
+NewStatusAuras.lua
