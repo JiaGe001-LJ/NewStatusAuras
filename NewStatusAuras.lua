@@ -1,368 +1,360 @@
---[[
-NewStatusAuras
-  - PowerAuras 风格的 TGA 光环
-  - 通过暴雪冷却管理器追踪增益，并替换为自定义光环
-
-命令：
-  /nsa              打开设置
-  /nsa import       从冷却管理器导入
-  /nsa cdm          打开暴雪冷却管理器
-  /nsa profiles     打开配置文件
-  /nsa test         测试光环
-  /nsa add 51271    添加指定法术
-]]
 local ADDON_NAME = ...
+local ADDON_VERSION = "1.7.1"
 
 NewStatusAurasDB = NewStatusAurasDB or {}
-local db
 local rootDB
-local GetSpellInfoSafe
-local currentCharacterKey
-local currentClassKey
+NewStatusAurasClassDB = NewStatusAurasClassDB or {}
+local classRootDB = NewStatusAurasClassDB
+-- 注入诊断：在 ADDON_LOADED（SavedVariables 注入完成后）记录注入的光环数据量
+local LOAD_INJECT_PROFILES, LOAD_INJECT_AURAS, LOAD_INJECT_GLOBAL_AURAS = 0, 0, 0
+local developerConfig = NewStatusAurasDeveloperConfig or {}
+local fontOptions = developerConfig.fonts or { { key = "standard", name = "系统默认", path = STANDARD_TEXT_FONT } }
+local db
+local optionsFrame
+local editFrame
+local selectedKey
+local editKey
+local auraClipboard
+local auraClipboardSource
+local auraFrames = {}
+local nativeContainers = {}
+local nativeMode = false
+local nativeSignature
+local rebuildPending = false
+local testMode = false
+local previewing = false
+local previewKey
+local previewDraft
+local RefreshGrid
+local UpdateDisplay
 
-local function SelectProfileDatabase()
-	rootDB = NewStatusAurasDB
-	rootDB.profileKeys = rootDB.profileKeys or {}
-	rootDB.profiles = rootDB.profiles or {}
-
-	local character = UnitName("player") or "Player"
-	local realm = GetRealmName and GetRealmName() or "Realm"
-	local characterKey = character .. "-" .. realm
-	currentCharacterKey = characterKey
-	local classKey = select(2, UnitClass("player")) or "DEFAULT"
-	currentClassKey = classKey
-
-	-- Migrate the previous flat database without discarding any saved aura data.
-	if rootDB.auras then
-		rootDB.profiles["默认"] = rootDB.profiles["默认"] or {
-			auras = rootDB.auras,
-			settings = rootDB.settings,
-		}
-		rootDB.auras = nil
-		rootDB.settings = nil
-		rootDB.profileKeys[characterKey] = "默认"
-	end
-
-	local profileName = rootDB.profileKeys[characterKey] or classKey
-	rootDB.profileKeys[characterKey] = profileName
-	if not rootDB.profiles[profileName] then
-		rootDB.profiles[profileName] = {
-			profileType = (profileName == classKey) and "职业" or "自定义",
-			class = classKey,
-			character = characterKey,
-		}
-	end
-	db = rootDB.profiles[profileName]
+local function NextAuraID()
+	rootDB.nextAuraID = (tonumber(rootDB.nextAuraID) or 0) + 1
+	return rootDB.nextAuraID
 end
 
-local function CreateDefaultAura(spellID, fallbackName)
-	local info = GetSpellInfoSafe(spellID)
+local function NormalizeColor(color)
+	color = type(color) == "table" and color or {}
 	return {
-		name = (info and info.name) or fallbackName or ((spellID and "Spell " .. spellID) or "New Aura"),
-		spellID = spellID or 0,
-		texture = "Aura1.tga",
-		size = 160,
-		x = 0,
-		y = 0,
-		opacity = 1,
-		showTimer = true,
-		timerSize = 44,
-		timerX = 0,
-		timerY = 0,
-		enabled = true,
-		animation = "none",
-		animationDuration = 2.4,
-		animationScale = 1.25,
-		color = { 1, 1, 1, 1 },
+		math.max(0, math.min(1, tonumber(color[1]) or 1)),
+		math.max(0, math.min(1, tonumber(color[2]) or 1)),
+		math.max(0, math.min(1, tonumber(color[3]) or 1)),
+		math.max(0, math.min(1, tonumber(color[4]) or 1)),
 	}
+end
+
+local function GetFontPath(key)
+	for _, entry in ipairs(fontOptions) do
+		if entry.key == key then return entry.path or STANDARD_TEXT_FONT end
+	end
+	return STANDARD_TEXT_FONT
+end
+
+local function GetFontName(key)
+	for _, entry in ipairs(fontOptions) do
+		if entry.key == key then return entry.name or entry.key end
+	end
+	return "系统默认"
 end
 
 local ADDON_ROOT = "Interface\\AddOns\\NewStatusAuras\\"
 local TEXTURE_DIR = ADDON_ROOT .. "Media\\Auras\\"
 local MAX_TEXTURES = 145
-local UPDATE_INTERVAL = 0.08
-
-local DEFAULT_SETTINGS = {
+local TEXTURE_GROUPS = {
+	{
+		name = "光环图库（Media\\Auras）",
+		folder = "",
+		files = function()
+			local files = {}
+			for number = 1, MAX_TEXTURES do files[#files + 1] = "Aura" .. number .. ".tga" end
+			return files
+		end,
+	},
 }
 
 local ANIMATION_NAMES = {
 	none = "无动画",
 	rotate = "旋转",
-	fade = "渐隐渐现",
-	pulse = "对称脉冲",
-	stretch = "变形",
-	spinFade = "旋转渐隐",
+	fade = "渐隐",
+	pulse = "脉冲",
+	stretch = "拉伸",
+	spinFade = "旋转 + 渐隐",
+	wipeDown = "从上到下消失",
+	wipeUp = "从下到上消失",
+	fadeDown = "渐隐（上到下）",
+	fadeUp = "渐隐（下到上）",
 }
-
-local ANIMATION_ORDER = { "none", "rotate", "fade", "pulse", "stretch", "spinFade" }
-
-local function Print(...)
-	print("|cffccaa33[NSA]|r", ...)
-end
+local ANIMATION_ORDER = { "none", "rotate", "fade", "pulse", "stretch", "spinFade", "wipeDown", "wipeUp", "fadeDown", "fadeUp" }
 
 local function CopyTable(source)
 	local result = {}
 	for key, value in pairs(source or {}) do
-		if type(value) == "table" then
-			result[key] = CopyTable(value)
-		else
-			result[key] = value
-		end
+		result[key] = type(value) == "table" and CopyTable(value) or value
 	end
 	return result
 end
 
-local function EnsureDatabase()
-	db.auras = db.auras or {}
-	db.settings = db.settings or {}
-	for key, value in pairs(DEFAULT_SETTINGS) do
-		if db.settings[key] == nil then
-			db.settings[key] = value
+local function CountAuras(profile)
+	local count = 0
+	if type(profile) == "table" and type(profile.auras) == "table" then
+		for _, aura in pairs(profile.auras) do
+			if type(aura) == "table" then count = count + 1 end
 		end
 	end
+	return count
+end
 
-	for index, aura in ipairs(db.auras) do
-		aura.name = (aura.name and aura.name ~= "") and aura.name or ("光环" .. index)
-		aura.texture = aura.texture or "Aura1.tga"
-		aura.size = aura.size or 128
-		aura.x = aura.x or 0
-		aura.y = aura.y or 0
-		aura.opacity = aura.opacity or 1
-		aura.timerSize = aura.timerSize or 44
-		aura.timerX = aura.timerX or 0
-		aura.timerY = aura.timerY or 0
-		if aura.showTimer == nil then aura.showTimer = true end
-		if aura.enabled == nil then aura.enabled = true end
-		aura.color = aura.color or { 1, 1, 1, 1 }
-		aura.animation = aura.animation or "none"
-		aura.animationDuration = aura.animationDuration or 2.4
-		aura.animationScale = aura.animationScale or 1.25
-		if aura.mirrorX == nil then aura.mirrorX = false end
-		if aura.mirrorY == nil then aura.mirrorY = false end
+local function Print(message)
+	print("|cff66ccff[NSA]|r " .. tostring(message or ""))
+end
+
+local function GetSpellInfoSafe(spellID)
+	spellID = tonumber(spellID)
+	if not spellID or spellID <= 0 then return nil end
+	if C_Spell and C_Spell.GetSpellInfo then
+		local ok, info = pcall(C_Spell.GetSpellInfo, spellID)
+		if ok and info then return info end
+	end
+	if GetSpellInfo then
+		local ok, name, _, icon = pcall(GetSpellInfo, spellID)
+		if ok and name then return { name = name, iconID = icon } end
 	end
 end
 
 local function NormalizeTexture(value)
 	local path = tostring(value or ""):gsub("/", "\\")
 	path = path:gsub("^%s+", ""):gsub("%s+$", "")
-	if path == "" then
-		return "Aura1.tga"
-	end
-	if path:sub(1, 1) == "\\" then
-		path = path:sub(2)
-	end
-	return path
+	return path ~= "" and path or "Aura1.tga"
 end
 
 local function GetTexturePath(value)
 	local path = NormalizeTexture(value)
-	if path:match("^Interface\\") then
-		return path
-	end
-	if path:match("^Media\\") or path:match("^media\\") then
-		return ADDON_ROOT .. path
-	end
-	if path:match("^Auras\\") or path:match("^auras\\") then
-		return ADDON_ROOT .. "Media\\" .. path
-	end
-	if not path:find("\\") and not path:find("/") and not path:match("^Aura%d+%.tga$") then
-		return ADDON_ROOT .. "Media\\" .. path
-	end
+	if path:match("^Interface\\") then return path end
+	if path:match("^Media\\") or path:match("^media\\") then return ADDON_ROOT .. path end
+	if path:match("^Auras\\") or path:match("^auras\\") then return ADDON_ROOT .. "Media\\" .. path end
 	return TEXTURE_DIR .. path
 end
 
-local function FormatTime(seconds)
-	if type(seconds) ~= "number" then
-		return ""
-	end
-	local ok, result = pcall(function()
-		seconds = math.max(0, seconds)
-		if seconds >= 60 then
-			return string.format("%d:%.2d", math.floor(seconds / 60), math.floor(seconds % 60))
-		end
-		return string.format("%.1f", seconds)
-	end)
-	if ok then
-		return result
-	end
-	return "..."
+local function CreateDefaultAura(spellID)
+	local info = GetSpellInfoSafe(spellID)
+	return {
+		id = NextAuraID(),
+		name = (info and info.name) or "新光环",
+		spellID = tonumber(spellID) or 0,
+		texture = "Aura1.tga",
+		size = 160, x = 0, y = 0, opacity = 1,
+		showTimer = true, timerSize = 44, timerX = 0, timerY = 0,
+		timerFont = "standard",
+		timerColor = { 1, 1, 1, 1 }, color = { 1, 1, 1, 1 },
+		enabled = true, animation = "none", animationDuration = 2.4,
+		animationScale = 1.25, mirrorX = false, mirrorY = false,
+	}
 end
 
-GetSpellInfoSafe = function(spellID)
-	if not spellID or spellID <= 0 then
-		return nil
-	end
-	if C_Spell and C_Spell.GetSpellInfo then
-		local ok, info = pcall(C_Spell.GetSpellInfo, spellID)
-		if ok and info then
-			return info
+local function SelectProfileDatabase()
+	if not rootDB then rootDB = NewStatusAurasDB or {} end
+	rootDB.profiles = rootDB.profiles or {}
+	local characterKey = (UnitName("player") or "Player") .. "-" .. (GetRealmName and GetRealmName() or "Realm")
+	local classKey = select(2, UnitClass("player")) or "DEFAULT"
+	local profile = rootDB.profiles[classKey]
+	if type(profile) ~= "table" or CountAuras(profile) == 0 then
+		-- 严格按职业隔离：只迁移"同职业"的旧版数据，绝不从 rootDB.auras 继承其他职业的光环
+		local legacyProfile = rootDB.classProfiles and rootDB.classProfiles[classKey]
+		local legacyClassProfile = classRootDB[classKey]
+		if type(legacyProfile) == "table" and CountAuras(legacyProfile) > 0 then
+			profile = CopyTable(legacyProfile)
+		elseif type(legacyClassProfile) == "table" and CountAuras(legacyClassProfile) > 0 then
+			profile = CopyTable(legacyClassProfile)
+		else
+			-- 旧版全局列表：仅当整个数据库从未迁移过、且当前职业确实没有配置时，一次性迁入
+			if not rootDB.legacyMigrated then
+				local hasAnyProfile = false
+				for _, p in pairs(rootDB.profiles) do
+					if type(p) == "table" and CountAuras(p) > 0 then hasAnyProfile = true break end
+				end
+				if not hasAnyProfile and type(rootDB.auras) == "table" and CountAuras({ auras = rootDB.auras }) > 0 then
+					profile = { auras = CopyTable(rootDB.auras), settings = CopyTable(rootDB.settings or {}) }
+				end
+				rootDB.legacyMigrated = true
+			end
+			profile = profile or { auras = {}, settings = {} }
 		end
 	end
-	if GetSpellInfo then
-		local ok, name, _, icon = pcall(GetSpellInfo, spellID)
-		if ok and name then
-			return { name = name, iconID = icon }
-		end
+	profile.class, profile.profileType = classKey, "职业"
+	rootDB.profiles[classKey] = profile
+	db = profile
+	db.characterKey, db.profileName = characterKey, classKey
+end
+
+local function EnsureDatabase()
+	db.auras = db.auras or {}
+	db.settings = db.settings or {}
+	local usedIDs = {}
+	for index, aura in ipairs(db.auras) do
+		aura.name = aura.name and aura.name ~= "" and aura.name or ("光环 " .. index)
+		aura.texture = NormalizeTexture(aura.texture)
+		aura.size = tonumber(aura.size) or 160
+		aura.x, aura.y = tonumber(aura.x) or 0, tonumber(aura.y) or 0
+		aura.opacity = tonumber(aura.opacity) or 1
+		if aura.showTimer == nil then aura.showTimer = true end
+		if aura.enabled == nil then aura.enabled = true end
+		aura.timerSize = tonumber(aura.timerSize) or 44
+		aura.timerX, aura.timerY = tonumber(aura.timerX) or 0, tonumber(aura.timerY) or 0
+		aura.timerFont = aura.timerFont or "standard"
+		aura.color = NormalizeColor(aura.color)
+		aura.timerColor = NormalizeColor(aura.timerColor)
+		aura.id = tonumber(aura.id)
+		if not aura.id or usedIDs[aura.id] then aura.id = NextAuraID() end
+		usedIDs[aura.id] = true
+		rootDB.nextAuraID = math.max(tonumber(rootDB.nextAuraID) or 0, aura.id)
+		aura.animation = aura.animation or "none"
+		aura.animationDuration = tonumber(aura.animationDuration) or 2.4
+		aura.animationScale = tonumber(aura.animationScale) or 1.25
 	end
 end
 
--- 12.x 首选 GetPlayerAuraBySpellID，旧版本和部分客户端使用 GetUnitAuraBySpellID。
+local function RecoverNonEmptyProfile()
+	return db and CountAuras(db) > 0
+end
+
+local function RefreshLoadedProfile()
+	if not db or CountAuras(db) == 0 then
+		SelectProfileDatabase()
+		EnsureDatabase()
+	end
+	UpdateDisplay()
+end
+
+local function ReportLoadedProfile()
+	local ok, message = pcall(RefreshLoadedProfile)
+	if not ok then
+		Print("读取配置时发生错误：" .. tostring(message))
+		return
+	end
+	Print("已加载 " .. CountAuras(db) .. " 个光环（配置：" .. tostring(db.profileName or "默认") .. "）。输入 /nsa 打开设置。")
+end
+
+local function SaveCurrentDatabase()
+	if not rootDB then rootDB = NewStatusAurasDB or {} end
+	if not db then return end
+	rootDB.profiles = rootDB.profiles or {}
+	rootDB.profileKeys = rootDB.profileKeys or {}
+	local profileName = db.class or db.profileName or "DEFAULT"
+	if db.characterKey then rootDB.profileKeys[db.characterKey] = profileName end
+	db.profileName, db.profileType = profileName, "职业"
+	rootDB.profiles[profileName] = db
+	rootDB.profiles[profileName].auras = db.auras
+	rootDB.lastSavedProfile = profileName
+	rootDB.lastSavedAuraCount = CountAuras(db)
+	rootDB.lastSavedAt = date and date("%Y-%m-%d %H:%M:%S") or tostring(GetTime and GetTime() or 0)
+	rootDB.nextAuraID = tonumber(rootDB.nextAuraID) or 0
+end
+
+local function FindAuraIndex(id)
+	for index, aura in ipairs(db.auras) do if aura.id == id then return index end end
+end
+
+local function MakeUniqueAuraName(baseName)
+	baseName = tostring(baseName or "光环")
+	if baseName == "" then baseName = "光环" end
+	local used = {}
+	for _, aura in ipairs(db.auras) do used[aura.name or ""] = true end
+	if not used[baseName] then return baseName end
+	local suffix = 1
+	while used[baseName .. suffix] do suffix = suffix + 1 end
+	return baseName .. suffix
+end
+
+local function Serialize(value)
+	if type(value) == "table" then
+		local result, first = { "{" }, true
+		for key, item in pairs(value) do
+			if not first then result[#result + 1] = "," end
+			first = false
+			local serializedKey = type(key) == "string" and "[\"" .. key:gsub("\\", "\\\\"):gsub("\"", "\\\"") .. "\"]" or "[" .. tostring(key) .. "]"
+			result[#result + 1] = serializedKey .. "=" .. Serialize(item)
+		end
+		result[#result + 1] = "}"
+		return table.concat(result)
+	elseif type(value) == "string" then
+		return "\"" .. value:gsub("\\", "\\\\"):gsub("\"", "\\\""):gsub("\n", "\\n") .. "\""
+	elseif type(value) == "number" or type(value) == "boolean" then
+		return tostring(value)
+	end
+	return "nil"
+end
+
+local function ExportString(selectedOnly)
+	local data = {}
+	for _, aura in ipairs(db.auras) do
+		if not selectedOnly or aura.selected then data[#data + 1] = CopyTable(aura) end
+	end
+	return "NSA1:" .. Serialize(data)
+end
+
+local function ImportString(value)
+	value = strtrim(value or "")
+	if value:sub(1, 5) ~= "NSA1:" then return false, "无效的 NSA 导入字符串。" end
+	local code = value:sub(6)
+	if not code:match("^return") then code = "return " .. code end
+	local loader = loadstring or load
+	local fn, errorMessage = loader(code)
+	if not fn then return false, "解析失败：" .. tostring(errorMessage) end
+	local ok, data = pcall(fn)
+	if not ok or type(data) ~= "table" then return false, "导入的数据无效。" end
+	local count = 0
+	for _, sourceAura in ipairs(data) do
+		if type(sourceAura) == "table" then
+			local aura = CopyTable(sourceAura)
+			aura.id = NextAuraID()
+			aura.name = MakeUniqueAuraName(aura.name)
+			aura.selected = false
+			table.insert(db.auras, aura)
+			count = count + 1
+		end
+	end
+	EnsureDatabase()
+	SaveCurrentDatabase()
+	return true, "已导入 " .. count .. " 个光环，并追加到当前配置。"
+end
+
 local function GetPlayerAura(spellID)
-	if not spellID or spellID <= 0 or not C_UnitAuras then
-		return nil
-	end
-
+	if not C_UnitAuras then return nil end
 	if C_UnitAuras.GetPlayerAuraBySpellID then
 		local ok, aura = pcall(C_UnitAuras.GetPlayerAuraBySpellID, spellID)
-		if ok and aura then
-			return aura
-		end
+		if ok and aura then return aura end
 	end
-
 	if C_UnitAuras.GetUnitAuraBySpellID then
 		local ok, aura = pcall(C_UnitAuras.GetUnitAuraBySpellID, "player", spellID)
-		if ok and aura then
-			return aura
-		end
+		if ok and aura then return aura end
 	end
-
-	if C_UnitAuras.GetUnitAuras then
-		local ok, auras = pcall(C_UnitAuras.GetUnitAuras, "player", "HELPFUL")
-		if ok and auras then
-			for _, aura in ipairs(auras) do
-				local auraSpellID = aura.spellId or aura.spellID
-				if auraSpellID == spellID then
-					return aura
-				end
-			end
-		end
-	end
-
 	if C_UnitAuras.GetAuraDataByIndex then
 		for index = 1, 40 do
 			local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "player", index, "HELPFUL")
-			if not ok or not aura then
-				break
-			end
-			local auraSpellID = aura.spellId or aura.spellID
-			if auraSpellID == spellID then
-				return aura
-			end
+			if not ok or not aura then break end
+			if aura.spellId == spellID or aura.spellID == spellID then return aura end
 		end
 	end
 end
 
--- Cooldown Manager is the combat-safe source for tracked buffs.  In combat the
--- aura payload can contain secret values, but CDM keeps the item frame and its
--- auraInstanceID available.  We only compare auraInstanceID with nil here.
-local cdmKeysByID = {}
-local cdmViewers = {
-	"BuffBarCooldownViewer",
-	"BuffIconCooldownViewer",
-}
-
-local function AddCDMKey(keys, id)
-	if type(id) == "number" and id > 0 then
-		keys[id] = true
-	end
-end
-
+local cdmViewers = { "BuffBarCooldownViewer", "BuffIconCooldownViewer" }
+local cdmKeys = {}
+local function ResetCDMCache() wipe(cdmKeys) end
 local function GetCDMKeys(cooldownID)
-	if not cooldownID or not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCooldownInfo then
-		return nil
-	end
-	if cdmKeysByID[cooldownID] ~= nil then
-		return cdmKeysByID[cooldownID] or nil
-	end
-
+	if not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCooldownInfo then return nil end
+	if cdmKeys[cooldownID] then return cdmKeys[cooldownID] end
 	local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
-	if not ok or not info then
-		cdmKeysByID[cooldownID] = false
-		return nil
-	end
-
+	if not ok or not info then return nil end
 	local keys = {}
-	AddCDMKey(keys, info.spellID)
-	AddCDMKey(keys, info.spellId)
-	AddCDMKey(keys, info.overrideSpellID)
-	AddCDMKey(keys, info.overrideSpellId)
-	AddCDMKey(keys, info.overrideTooltipSpellID)
-	if type(info.linkedSpellIDs) == "table" then
-		for _, linkedSpellID in ipairs(info.linkedSpellIDs) do
-			AddCDMKey(keys, linkedSpellID)
-		end
+	for _, field in ipairs({ "spellID", "spellId", "overrideSpellID", "overrideSpellId", "overrideTooltipSpellID" }) do
+		if type(info[field]) == "number" then keys[info[field]] = true end
 	end
-
-	if not next(keys) then
-		cdmKeysByID[cooldownID] = false
-		return nil
-	end
-	cdmKeysByID[cooldownID] = keys
+	cdmKeys[cooldownID] = keys
 	return keys
 end
 
-local function GetCDMDuration(frame)
-	if not frame then
-		return nil
-	end
-	if frame.nsaDurationObject then
-		return frame.nsaDurationObject
-	end
-	if frame.cdmDurationObj then
-		return frame.cdmDurationObj
-	end
-	-- 12.1 exposes the combat-safe DurationObject even when aura fields are
-	-- secret. Do not gate this call on ShouldAurasBeSecret; Cooldown frames are
-	-- specifically designed to render this object without Lua arithmetic.
-	if frame.auraInstanceID ~= nil and C_UnitAuras and C_UnitAuras.GetAuraDuration then
-		local ok, durationObject = pcall(C_UnitAuras.GetAuraDuration, "player", frame.auraInstanceID)
-		if ok and durationObject then
-			return durationObject
-		end
-	end
-	return nil
-end
-
-local function IsReadableNumber(value)
-	return type(value) == "number" and not (issecretvalue and issecretvalue(value))
-end
-
-local function GetCDMRemaining(state, now)
-	if not state then return nil, nil end
-	local startTime = state.startTime
-	local duration = state.duration
-	local modRate = state.modRate or 1
-	if not (IsReadableNumber(startTime) and IsReadableNumber(duration) and IsReadableNumber(modRate)) then
-		return nil, nil
-	end
-	if duration <= 0 or modRate <= 0 then
-		return nil, duration
-	end
-	local remaining = startTime + duration / modRate - now
-	if remaining < 0 then remaining = 0 end
-	return remaining, duration / modRate
-end
-
-local function GetCDMCooldownValues(frame)
-	if not frame then return nil, nil, nil end
-	for _, fieldName in ipairs({ "Cooldown", "cooldown" }) do
-		local cooldown = frame[fieldName]
-		if cooldown and cooldown.GetCooldownTimes then
-			local ok, startTime, duration, modRate = pcall(cooldown.GetCooldownTimes, cooldown)
-			if ok and startTime and duration then
-				return startTime, duration, modRate
-			end
-		end
-	end
-	return nil, nil, nil
-end
-
--- Returns the first matching CDM item.  This deliberately does not read spell
--- IDs from the aura payload, so it remains usable while the player is in combat.
 local function GetCDMTrackedAura(spellID)
-	if not spellID or not C_CooldownViewer then
-		return nil
-	end
+	if not C_CooldownViewer then return nil end
 	for _, viewerName in ipairs(cdmViewers) do
 		local viewer = _G[viewerName]
 		local pool = viewer and viewer.itemFramePool
@@ -370,1646 +362,544 @@ local function GetCDMTrackedAura(spellID)
 			for frame in pool:EnumerateActive() do
 				local keys = frame.cooldownID and GetCDMKeys(frame.cooldownID)
 				if keys and keys[spellID] then
-					local active = frame.auraInstanceID ~= nil
-					local okInfo, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, frame.cooldownID)
-					local startTime, duration, modRate = GetCDMCooldownValues(frame)
-					return {
-						active = active,
-						frame = frame,
-						info = okInfo and info or nil,
-						durationObject = active and GetCDMDuration(frame) or nil,
-						startTime = active and (frame.nsaCooldownStart or startTime) or nil,
-						duration = active and (frame.nsaCooldownDuration or duration) or nil,
-						modRate = active and (frame.nsaCooldownModRate or modRate) or nil,
-					}
+					local cooldown = frame.Cooldown or frame.cooldown
+					local startTime, duration, modRate
+					if cooldown and cooldown.GetCooldownTimes then
+						local ok, start, dur, rate = pcall(cooldown.GetCooldownTimes, cooldown)
+						if ok then startTime, duration, modRate = start, dur, rate end
+					end
+					local durationObject = frame.nsaDurationObject
+					if not durationObject and frame.auraInstanceID and C_UnitAuras.GetAuraDuration then
+						local ok, object = pcall(C_UnitAuras.GetAuraDuration, "player", frame.auraInstanceID)
+						if ok then durationObject = object end
+					end
+					return { active = frame.auraInstanceID ~= nil, frame = frame, durationObject = durationObject, startTime = startTime, duration = duration, modRate = modRate }
 				end
 			end
 		end
 	end
 end
 
-local function GetCDMCountdownText(frame)
-	if not frame then return nil end
-	for _, regionName in ipairs({ "Duration", "Time", "CooldownText", "Cooldown" }) do
-		local region = frame[regionName]
-		if region and region.GetText then
-			local ok, text = pcall(region.GetText, region)
-			if ok and type(text) == "string" and text ~= "" then
-				return text
-			end
+local function HideBlizzardBars()
+	local viewer = _G.BuffBarCooldownViewer
+	if viewer then
+		viewer:SetAlpha(0)
+		if not viewer.nsaHooked then
+			viewer.nsaHooked = true
+			viewer:HookScript("OnShow", function(self) self:SetAlpha(0) end)
 		end
 	end
-	return nil
 end
 
-local function ResetCDMKeyCache()
-	wipe(cdmKeysByID)
+local function CanUseNative()
+	return type(CreateFrame) == "function" and type(AuraContainerSortMethod) == "table" and type(AuraContainerSortDirection) == "table" and (not DoesTemplateExist or DoesTemplateExist("CustomAuraContainerTemplate"))
 end
 
--- 将可能受到秘密值限制的字段放在 pcall 内，避免造成整段插件报错。
-local function GetAuraTiming(aura)
-	if not aura then
-		return nil, nil
-	end
-	local ok, expirationTime, duration = pcall(function()
-		return aura.expirationTime, aura.duration
-	end)
-	if not ok then
-		return nil, nil
-	end
-	return expirationTime, duration
-end
-
-local function GetRemaining(aura, now)
-	local expirationTime, duration = GetAuraTiming(aura)
-	if expirationTime == nil then
-		return nil, duration
-	end
-	local ok, remaining = pcall(function()
-		return expirationTime - now
-	end)
-	if not ok or type(remaining) ~= "number" then
-		return nil, duration
-	end
-	return remaining, duration
-end
-
-local function SafeGreater(left, right)
-	local ok, result = pcall(function()
-		return left > right
-	end)
-	if not ok or (issecretvalue and issecretvalue(result)) then
-		return false
-	end
-	return result == true
-end
-
-local function SafeLessEqual(left, right)
-	local ok, result = pcall(function()
-		return left <= right
-	end)
-	if not ok or (issecretvalue and issecretvalue(result)) then
-		return false
-	end
-	return result == true
-end
-
--- ---------------------------------------------------------------------------
--- 导入 / 导出
--- ---------------------------------------------------------------------------
-local function SerializeValue(value)
-	if type(value) == "table" then
-		local parts = { "{ " }
-		local first = true
-		for key, item in pairs(value) do
-			if not first then
-				parts[#parts + 1] = ", "
-			end
-			first = false
-			local serializedKey
-			if type(key) == "string" then
-				serializedKey = "[\"" .. key:gsub("\\", "\\\\"):gsub("\"", "\\\"") .. "\"]"
-			else
-				serializedKey = "[" .. tostring(key) .. "]"
-			end
-			parts[#parts + 1] = serializedKey .. "=" .. SerializeValue(item)
-		end
-		parts[#parts + 1] = " }"
-		return table.concat(parts)
-	elseif type(value) == "string" then
-		return "\"" .. value:gsub("\\", "\\\\"):gsub("\"", "\\\""):gsub("\n", "\\n") .. "\""
-	elseif type(value) == "boolean" or type(value) == "number" then
-		return tostring(value)
-	end
-	return "nil"
-end
-
-local function ExportString(selectedOnly)
-	if not selectedOnly then
-		return "NSA1:" .. SerializeValue(db.auras)
-	end
-	local selected = {}
-	for _, aura in ipairs(db.auras) do
-		if aura.selected then
-			table.insert(selected, CopyTable(aura))
-		end
-	end
-	return "NSA1:" .. SerializeValue(selected)
-end
-
-local function ImportString(value)
-	if not value then
-		return false, "空字符串"
-	end
-	value = value:gsub("^%s+", ""):gsub("%s+$", "")
-	if value:sub(1, 5) ~= "NSA1:" then
-		return false, "不是 NewStatusAuras 字符串"
-	end
-
-	local code = value:sub(6)
-	if not code:find("^return") then
-		code = "return " .. code
-	end
-	local loader = loadstring or load
-	local fn, errorMessage = loader(code)
-	if not fn then
-		return false, "解析失败: " .. tostring(errorMessage)
-	end
-	local ok, data = pcall(fn)
-	if not ok or type(data) ~= "table" then
-		return false, "数据格式不对"
-	end
-	db.auras = data
-	EnsureDatabase()
-	return true, "导入成功，共 " .. #db.auras .. " 个特效"
-end
-
--- ---------------------------------------------------------------------------
--- 运行时显示
--- ---------------------------------------------------------------------------
-local auraFrames = {}
-local nativeAuraContainers = {}
-local nativeAuraContainerMode = false
-local nativeAuraRebuildPending = false
-local nativeAuraSignature
-local updateElapsed = 0
-local testMode = false
-
-local function CanUseNativeAuraContainers()
-	return type(CreateFrame) == "function"
-		and type(AuraContainerSortMethod) == "table"
-		and type(AuraContainerSortDirection) == "table"
-		and (not DoesTemplateExist or DoesTemplateExist("CustomAuraContainerTemplate"))
-end
-
-local function HideLegacyAuraFrames()
-	for _, frame in pairs(auraFrames) do
-		frame:Hide()
-		if frame.cooldown then frame.cooldown:Hide() end
-		if frame.timer then frame.timer:Hide() end
-	end
-end
-
-local function ClearNativeAuraContainers()
-	for _, container in pairs(nativeAuraContainers) do
+local function ClearNative()
+	for _, container in pairs(nativeContainers) do
 		pcall(container.SetUnit, container, "none")
 		pcall(container.Hide, container)
 	end
-	wipe(nativeAuraContainers)
-	nativeAuraContainerMode = false
+	wipe(nativeContainers)
+	nativeMode = false
 end
 
-local function GetNativeAuraSignature()
-	local parts = {}
-	for index, aura in ipairs(db and db.auras or {}) do
-		parts[#parts + 1] = table.concat({
-			index, aura.spellID or 0, aura.texture or "", aura.size or 0,
-			aura.x or 0, aura.y or 0, aura.opacity or 1,
-			aura.timerSize or 44, aura.timerX or 0, aura.timerY or 0,
-			aura.showTimer == false and 0 or 1, aura.enabled == false and 0 or 1,
-			aura.animation or "none", aura.animationDuration or 2.4,
-			(aura.color and table.concat(aura.color, ",")) or "",
-			aura.mirrorX and 1 or 0, aura.mirrorY and 1 or 0,
-		}, ":")
-	end
-	return table.concat(parts, "|")
+local function GetAuraConfig(index, aura)
+	if previewing and index == previewKey and previewDraft then return previewDraft end
+	return aura
 end
 
-local function BuildNativeAuraContainer(index, aura)
-	local spellID = tonumber(aura.spellID)
-	if aura.enabled == false or not spellID or spellID <= 0 then
-		return
-	end
-
+local function BuildNative(index, aura)
+	if aura.enabled == false or not tonumber(aura.spellID) or tonumber(aura.spellID) <= 0 then return false end
 	local ok, container = pcall(CreateFrame, "AuraContainer", nil, UIParent, "CustomAuraContainerTemplate")
-	if not ok or not container then
-		return false
-	end
-	container:SetSize(aura.size or 128, aura.size or 128)
+	if not ok or not container then return false end
+	local config = CopyTable(aura)
+	container:SetSize(config.size, config.size)
+	container:SetPoint("CENTER", UIParent, "CENTER", config.x, config.y)
 	container:SetFrameStrata("MEDIUM")
-	container:SetPoint("CENTER", UIParent, "CENTER", aura.x or 0, aura.y or 0)
-	container:SetClipsChildren(false)
-	local auraConfig = CopyTable(aura)
-
+	local spellID = tonumber(config.spellID)
 	local groupOptions = {
 		maxFrameCount = 1,
 		candidateFilters = { includeSpellIDs = { [spellID] = true } },
 		initializeFrame = function(button)
-			button:SetSize(auraConfig.size or 128, auraConfig.size or 128)
+			button:SetSize(config.size, config.size)
 			button:SetMouseClickEnabled(false)
 			button:SetMouseMotionEnabled(false)
-
-			-- Keep Blizzard's icon region as the AuraContainer source, then place
-			-- the user TGA above it so Blizzard can refresh its own region freely.
 			local nativeIcon = button:CreateTexture(nil, "ARTWORK")
 			nativeIcon:SetAllPoints(button)
 			button:SetIcon(nativeIcon)
-			-- The native icon is only used as AuraContainer's data source.  Keep
-			-- Blizzard's duration engine, but do not draw its duplicate icon.
 			nativeIcon:SetAlpha(0)
 			local icon = button:CreateTexture(nil, "OVERLAY")
 			icon:SetAllPoints(button)
-			icon:SetBlendMode("ADD")
-			icon:SetTexture(GetTexturePath(auraConfig.texture))
-			icon:SetAlpha(auraConfig.opacity or 1)
-			local color = auraConfig.color or { 1, 1, 1, 1 }
+			icon:SetTexture(GetTexturePath(config.texture))
+			icon:SetAlpha(config.opacity)
+			local color = config.color or { 1, 1, 1, 1 }
 			icon:SetVertexColor(color[1] or 1, color[2] or 1, color[3] or 1, color[4] or 1)
-			icon:SetTexCoord(
-				auraConfig.mirrorX and 1 or 0, auraConfig.mirrorX and 0 or 1,
-				auraConfig.mirrorY and 1 or 0, auraConfig.mirrorY and 0 or 1
-			)
+			icon:SetTexCoord(config.mirrorX and 1 or 0, config.mirrorX and 0 or 1, config.mirrorY and 1 or 0, config.mirrorY and 0 or 1)
 			local cooldown = CreateFrame("Cooldown", nil, button, "CooldownFrameTemplate")
 			cooldown:SetAllPoints(button)
 			cooldown:SetDrawSwipe(false)
 			cooldown:SetDrawBling(false)
 			cooldown:SetDrawEdge(false)
-			cooldown:SetHideCountdownNumbers(auraConfig.showTimer == false)
-			if cooldown.SetUseAuraDisplayTime then
-				cooldown:SetUseAuraDisplayTime(true)
-			end
-			if cooldown.SetCountdownMillisecondsThreshold then
-				cooldown:SetCountdownMillisecondsThreshold(10)
-			end
+			cooldown:SetHideCountdownNumbers(config.showTimer == false)
+			if cooldown.SetUseAuraDisplayTime then cooldown:SetUseAuraDisplayTime(true) end
+			if cooldown.SetCountdownMillisecondsThreshold then cooldown:SetCountdownMillisecondsThreshold(10) end
 			local countdown = cooldown.GetCountdownFontString and cooldown:GetCountdownFontString()
 			if countdown then
 				countdown:ClearAllPoints()
-				countdown:SetPoint("CENTER", button, "CENTER", auraConfig.timerX or 0, auraConfig.timerY or 0)
-				countdown:SetFont(STANDARD_TEXT_FONT, auraConfig.timerSize or 44, "OUTLINE")
+				countdown:SetPoint("CENTER", button, "CENTER", config.timerX, config.timerY)
+				countdown:SetFont(GetFontPath(config.timerFont), config.timerSize, "OUTLINE")
+				local timerColor = config.timerColor or { 1, 1, 1, 1 }
+				pcall(countdown.SetTextColor, countdown, timerColor[1] or 1, timerColor[2] or 1, timerColor[3] or 1, timerColor[4] or 1)
 			end
 			button:SetDurationCooldown(cooldown)
-
-			if auraConfig.animation and auraConfig.animation ~= "none" then
-				local animation = icon:CreateAnimationGroup()
-				local duration = math.max(0.2, tonumber(auraConfig.animationDuration) or 2.4)
-				if auraConfig.animation == "rotate" or auraConfig.animation == "spinFade" then
-					local rotation = animation:CreateAnimation("Rotation")
-					rotation:SetDegrees(360)
-					rotation:SetDuration(duration)
-				end
-				if auraConfig.animation == "fade" or auraConfig.animation == "spinFade" then
-					local alpha = animation:CreateAnimation("Alpha")
-					alpha:SetFromAlpha(0.2)
-					alpha:SetToAlpha(1)
-					alpha:SetDuration(duration / 2)
-					alpha:SetOrder(1)
-					local alphaBack = animation:CreateAnimation("Alpha")
-					alphaBack:SetFromAlpha(1)
-					alphaBack:SetToAlpha(0.2)
-					alphaBack:SetDuration(duration / 2)
-					alphaBack:SetOrder(2)
-				end
-				animation:SetLooping("REPEAT")
-				animation:Play()
+			if config.animation ~= "none" then
+				local group = icon:CreateAnimationGroup()
+				local duration = math.max(0.2, config.animationDuration or 2.4)
+				if config.animation == "rotate" or config.animation == "spinFade" then local anim = group:CreateAnimation("Rotation"); anim:SetDegrees(360); anim:SetDuration(duration) end
+				if config.animation == "fade" or config.animation == "spinFade" then local anim = group:CreateAnimation("Alpha"); anim:SetFromAlpha(0.2); anim:SetToAlpha(1); anim:SetDuration(duration / 2); local back = group:CreateAnimation("Alpha"); back:SetFromAlpha(1); back:SetToAlpha(0.2); back:SetDuration(duration / 2); back:SetOrder(2) end
+				if config.animation == "wipeDown" or config.animation == "wipeUp" then local scale = group:CreateAnimation("Scale"); scale:SetScale(1, 0.01); scale:SetOrigin(config.animation == "wipeDown" and "TOP" or "BOTTOM", 0, 0); scale:SetDuration(duration); local alpha = group:CreateAnimation("Alpha"); alpha:SetFromAlpha(1); alpha:SetToAlpha(0); alpha:SetDuration(duration) end
+				group:SetLooping("REPEAT")
+				group:Play()
 			end
 		end,
 	}
-
-	local added = pcall(container.AddAuraGroup, container, "NSA" .. index, "HELPFUL|PLAYER", groupOptions)
-	if not added then
-		pcall(container.Hide, container)
-		return false
-	end
-	local unitSet = pcall(container.SetUnit, container, "player")
-	if not unitSet then
-		pcall(container.Hide, container)
-		return false
-	end
+	local added = pcall(container.AddAuraGroup, container, "NSA" .. tostring(config.id or index), "HELPFUL|PLAYER", groupOptions)
+	if not added then return false end
+	local set = pcall(container.SetUnit, container, "player")
+	if not set then return false end
 	pcall(container.UpdateAllAuras, container)
 	container:Show()
-	nativeAuraContainers[index] = container
+	nativeContainers[index] = container
 	return true
 end
 
-local function RebuildNativeAuraContainers()
-	if not db or not CanUseNativeAuraContainers() then
-		return false
-	end
-	if InCombatLockdown and InCombatLockdown() then
-		nativeAuraRebuildPending = true
-		return false
-	end
-	ClearNativeAuraContainers()
-	local built = false
-	for index, aura in ipairs(db.auras) do
-		if BuildNativeAuraContainer(index, aura) then
-			built = true
-		end
-	end
-	if built then
-		nativeAuraContainerMode = true
-		HideLegacyAuraFrames()
-	end
-	nativeAuraRebuildPending = false
-	nativeAuraSignature = GetNativeAuraSignature()
-	return built
+local function GetRemaining(aura)
+	if not aura then return nil end
+	local ok, value = pcall(function() return aura.expirationTime - GetTime() end)
+	if ok and type(value) == "number" then return math.max(0, value) end
 end
 
 local function CreateAuraFrame(aura)
 	local frame = CreateFrame("Frame", nil, UIParent)
-	frame:SetSize(aura.size or 128, aura.size or 128)
 	frame:SetFrameStrata("MEDIUM")
-	frame:EnableMouse(false)
 	frame:Hide()
-
-	frame.texture = frame:CreateTexture(nil, "ARTWORK")
+	frame.visualLayer = CreateFrame("Frame", nil, frame)
+	frame.visualLayer:SetAllPoints(frame)
+	frame.visualLayer:SetFrameLevel(frame:GetFrameLevel() + 1)
+	frame.texture = frame.visualLayer:CreateTexture(nil, "ARTWORK")
 	frame.texture:SetAllPoints(frame)
-	frame.texture:SetBlendMode("ADD")
-
-	frame.timer = frame:CreateFontString(nil, "OVERLAY", "NumberFont_Outline_Huge")
-	frame.timer:SetPoint("CENTER", frame, "CENTER", 0, 0)
-	frame.timer:Hide()
+	frame.texture:SetVertexColor(1, 1, 1, 1)
 	frame.cooldown = CreateFrame("Cooldown", nil, frame, "CooldownFrameTemplate")
 	frame.cooldown:SetAllPoints(frame)
-	frame.cooldown:SetDrawEdge(false)
 	frame.cooldown:SetDrawSwipe(false)
-	frame.cooldown:SetHideCountdownNumbers(false)
-	if frame.cooldown.SetUseAuraDisplayTime then
-		frame.cooldown:SetUseAuraDisplayTime(true)
-	end
-	frame.cooldownText = frame.cooldown.GetCountdownFontString and frame.cooldown:GetCountdownFontString() or nil
-	frame.cooldown:Hide()
-
-	frame.animation = frame:CreateAnimationGroup()
+	frame.cooldown:SetDrawEdge(false)
+	frame.cooldown:SetDrawBling(false)
+	if frame.cooldown.SetHideCountdownNumbers then frame.cooldown:SetHideCountdownNumbers(true) end
+	frame.cooldownText = frame.cooldown.GetCountdownFontString and frame.cooldown:GetCountdownFontString()
+	frame.timerLayer = CreateFrame("Frame", nil, frame)
+	frame.timerLayer:SetAllPoints(frame)
+	frame.timerLayer:SetFrameLevel(frame:GetFrameLevel() + 10)
+	frame.timer = frame.timerLayer:CreateFontString(nil, "OVERLAY", "NumberFont_Outline_Huge")
+	frame.timer:SetIgnoreParentAlpha(true)
+	frame.animation = frame.visualLayer:CreateAnimationGroup()
 	return frame
 end
 
-local function ConfigureAuraAnimation(frame, aura)
-	local color = aura.color or { 1, 1, 1, 1 }
-	local signature = table.concat({
-			aura.animation or "none", aura.animationDuration or 2.4,
-		(aura.color and table.concat(aura.color, ",")) or "",
-		aura.animationScale or 1.25, aura.mirrorX and 1 or 0,
-		aura.mirrorY and 1 or 0, color[1] or 1, color[2] or 1,
-		color[3] or 1, color[4] or 1,
-	}, ":")
-	if frame.animationKey == signature then
-		return
-	end
-	frame.animationKey = signature
-	if frame.animation:IsPlaying() then frame.animation:Stop() end
+local function ConfigureAnimation(frame, aura)
+	local signature = table.concat({ aura.animation, aura.animationDuration, aura.animationScale, aura.mirrorX and 1 or 0, aura.mirrorY and 1 or 0 }, ":")
+	if frame.animationSignature == signature then return end
+	frame.animationSignature = signature
+	frame.animation:Stop()
 	frame.animation:RemoveAnimations()
-	frame.texture:SetVertexColor(
-		color[1] or 1, color[2] or 1, color[3] or 1, color[4] or 1
-	)
-	local scaleX = aura.mirrorX and -1 or 1
-	local scaleY = aura.mirrorY and -1 or 1
+	local scaleX, scaleY = aura.mirrorX and -1 or 1, aura.mirrorY and -1 or 1
 	frame.texture:SetTexCoord(scaleX > 0 and 0 or 1, scaleX > 0 and 1 or 0, scaleY > 0 and 0 or 1, scaleY > 0 and 1 or 0)
-
-	local kind = aura.animation or "none"
-	local duration = math.max(0.2, tonumber(aura.animationDuration) or 2.4)
-	local group = frame.animation
-	if kind == "rotate" or kind == "spinFade" then
-		local rotation = group:CreateAnimation("Rotation")
-		rotation:SetDegrees(360)
-		rotation:SetDuration(duration)
-	end
-	if kind == "fade" or kind == "spinFade" then
-		local alpha = group:CreateAnimation("Alpha")
-		alpha:SetFromAlpha(0.2)
-		alpha:SetToAlpha(1)
-		alpha:SetDuration(duration / 2)
-		alpha:SetOrder(1)
-		alpha:SetSmoothing("IN_OUT")
-		local alphaBack = group:CreateAnimation("Alpha")
-		alphaBack:SetFromAlpha(1)
-		alphaBack:SetToAlpha(0.2)
-		alphaBack:SetDuration(duration / 2)
-		alphaBack:SetOrder(2)
-		alphaBack:SetSmoothing("IN_OUT")
-	elseif kind == "pulse" then
-		local scale = group:CreateAnimation("Scale")
-		scale:SetScale(tonumber(aura.animationScale) or 1.25, tonumber(aura.animationScale) or 1.25)
-		scale:SetDuration(duration / 2)
-		scale:SetOrder(1)
-		local scaleBack = group:CreateAnimation("Scale")
-		scaleBack:SetScale(1 / (tonumber(aura.animationScale) or 1.25), 1 / (tonumber(aura.animationScale) or 1.25))
-		scaleBack:SetDuration(duration / 2)
-		scaleBack:SetOrder(2)
-	elseif kind == "stretch" then
-		local scale = group:CreateAnimation("Scale")
-		scale:SetScale(tonumber(aura.animationScale) or 1.25, 1)
-		scale:SetDuration(duration / 2)
-		scale:SetOrder(1)
-		local scaleBack = group:CreateAnimation("Scale")
-		scaleBack:SetScale(1 / (tonumber(aura.animationScale) or 1.25), 1)
-		scaleBack:SetDuration(duration / 2)
-		scaleBack:SetOrder(2)
-	end
-	if kind ~= "none" then
-		group:SetLooping("REPEAT")
-		group:Play()
-	end
+	local duration = math.max(0.2, aura.animationDuration or 2.4)
+	if aura.animation == "rotate" or aura.animation == "spinFade" then local anim = frame.animation:CreateAnimation("Rotation"); anim:SetDegrees(360); anim:SetDuration(duration) end
+	if aura.animation == "fade" or aura.animation == "spinFade" then local anim = frame.animation:CreateAnimation("Alpha"); anim:SetFromAlpha(0.2); anim:SetToAlpha(1); anim:SetDuration(duration / 2); local back = frame.animation:CreateAnimation("Alpha"); back:SetFromAlpha(1); back:SetToAlpha(0.2); back:SetDuration(duration / 2); back:SetOrder(2) end
+	if aura.animation == "pulse" then local anim = frame.animation:CreateAnimation("Scale"); anim:SetScale(aura.animationScale, aura.animationScale); anim:SetDuration(duration / 2); local back = frame.animation:CreateAnimation("Scale"); back:SetScale(1 / aura.animationScale, 1 / aura.animationScale); back:SetDuration(duration / 2); back:SetOrder(2) end
+	if aura.animation == "stretch" then local anim = frame.animation:CreateAnimation("Scale"); anim:SetScale(aura.animationScale, 1); anim:SetDuration(duration / 2); local back = frame.animation:CreateAnimation("Scale"); back:SetScale(1 / aura.animationScale, 1); back:SetDuration(duration / 2); back:SetOrder(2) end
+	if aura.animation == "wipeDown" or aura.animation == "wipeUp" then local scale = frame.animation:CreateAnimation("Scale"); scale:SetScale(1, 0.01); scale:SetOrigin(aura.animation == "wipeDown" and "TOP" or "BOTTOM", 0, 0); scale:SetDuration(duration); local alpha = frame.animation:CreateAnimation("Alpha"); alpha:SetFromAlpha(1); alpha:SetToAlpha(0); alpha:SetDuration(duration) end
+	if aura.animation == "fadeDown" or aura.animation == "fadeUp" then local alpha = frame.animation:CreateAnimation("Alpha"); alpha:SetFromAlpha(1); alpha:SetToAlpha(0); alpha:SetDuration(duration); alpha:SetOrder(1); local move = frame.animation:CreateAnimation("Translation"); move:SetOffset(0, aura.animation == "fadeDown" and -aura.size or aura.size); move:SetDuration(duration); move:SetOrder(1) end
+	if aura.animation ~= "none" then frame.animation:SetLooping("REPEAT"); frame.animation:Play() end
 end
 
-local function HideBlizzardTrackedBars()
-	local names = { "BuffBarCooldownViewer" }
-	for _, name in ipairs(names) do
-		local viewer = _G[name]
-		if viewer then
-			pcall(viewer.Show, viewer)
-			-- Keep CDM alive and updating; only make its original tracked bar invisible.
-			pcall(viewer.SetAlpha, viewer, 0)
-			if not viewer.nsaHooked then
-				viewer.nsaHooked = true
-				viewer:HookScript("OnShow", function(self)
-					pcall(self.SetAlpha, self, 0)
-				end)
-			end
-		end
-	end
-end
-
-local function OpenCooldownManager()
-	if not CooldownViewerSettings and UIParentLoadAddOn then
-		UIParentLoadAddOn("Blizzard_CooldownViewer")
-	end
-	if CooldownViewerSettings and CooldownViewerSettings.TogglePanel then
-		CooldownViewerSettings:TogglePanel()
-		return true
-	end
-	Print("冷却管理器尚未加载，请先进入游戏后再试。")
-	return false
-end
-
-local function RefreshPreview(frame)
-	if not frame or not frame.previewHost or not frame.draft then return end
-	frame.previewHost.texture:SetTexture(GetTexturePath(frame.draft.texture))
-	frame.previewHost:SetSize(frame.draft.size or 150, frame.draft.size or 150)
-	frame.previewHost:ClearAllPoints()
-	frame.previewHost:SetPoint("CENTER", frame.previewArea or frame, "CENTER", frame.draft.x or 0, frame.draft.y or 0)
-	frame.previewHost:SetAlpha(frame.draft.opacity or 1)
-	if frame.previewTimer then
-		frame.previewTimer:ClearAllPoints()
-		frame.previewTimer:SetPoint("CENTER", frame.previewHost, "CENTER", frame.draft.timerX or 0, frame.draft.timerY or 0)
-		frame.previewTimer:SetFont(STANDARD_TEXT_FONT, frame.draft.timerSize or 44, "OUTLINE")
-		frame.previewTimer:SetText("8.8")
-		frame.previewTimer:SetTextColor(1, 1, 1)
-		frame.previewTimer:SetShown(frame.draft.showTimer ~= false)
-	end
-	ConfigureAuraAnimation(frame.previewHost, frame.draft)
-	if frame.draft.animation == "none" then
-		frame.previewHost.animation:Stop()
-	end
-	frame.previewHost:Show()
-end
-
-local function UpdateOneAura(key, aura)
-	local frame = auraFrames[key]
-	if not frame then
-		frame = CreateAuraFrame(aura)
-		auraFrames[key] = frame
-	end
-
-	local info = GetSpellInfoSafe(tonumber(aura.spellID))
-	local auraData = nil
-	local remaining, duration
-	local spellID = tonumber(aura.spellID)
-	local cdmState
-	local durationObject
-	local cdmText
-	local cdmRemaining
-	local cdmDuration
-
-	if aura.enabled ~= false and spellID and spellID > 0 then
-		if not testMode then
-			cdmState = GetCDMTrackedAura(spellID)
-			if cdmState then
-				if cdmState.active then
-					durationObject = cdmState.durationObject
-					auraData = cdmState.frame
-					cdmText = GetCDMCountdownText(cdmState.frame)
-					cdmRemaining, cdmDuration = GetCDMRemaining(cdmState, GetTime())
-					if cdmRemaining ~= nil then
-						remaining, duration = cdmRemaining, cdmDuration
-					end
-					-- Use the regular aura lookup only for readable timing/name data.
-					-- CDM remains the sole source of the combat-safe active boolean.
-					local readableAura = GetPlayerAura(spellID)
-					local readableRemaining, readableDuration = GetRemaining(readableAura, GetTime())
-					if readableAura and IsReadableNumber(readableRemaining) then
-						auraData = readableAura
-						remaining, duration = readableRemaining, readableDuration
-					end
-				end
-			else
-				auraData = GetPlayerAura(spellID)
-				remaining, duration = GetRemaining(auraData, GetTime())
-			end
-		else
-			auraData = { name = aura.name or "测试增益", icon = 134400 }
-			remaining, duration = 8.8, 10
-		end
-	end
-
-	local active = testMode or (cdmState and cdmState.active) or (not cdmState and auraData ~= nil)
-	if remaining ~= nil and SafeLessEqual(remaining, 0) then
-		active = false
-	end
-
-	if active then
-		frame:SetSize(aura.size or 128, aura.size or 128)
-		frame:ClearAllPoints()
-		frame:SetPoint("CENTER", UIParent, "CENTER", aura.x or 0, aura.y or 0)
-		frame.timer:ClearAllPoints()
-		frame.timer:SetPoint("CENTER", frame, "CENTER", aura.timerX or 0, aura.timerY or 0)
-		frame.texture:SetTexture(GetTexturePath(aura.texture))
-		frame.texture:SetAlpha(aura.opacity or 1)
-		if frame.cooldownText then
-			pcall(function()
-				frame.cooldownText:ClearAllPoints()
-				frame.cooldownText:SetPoint("CENTER", frame, "CENTER", aura.timerX or 0, aura.timerY or 0)
-				frame.cooldownText:SetFont(STANDARD_TEXT_FONT, aura.timerSize or 44, "OUTLINE")
-			end)
-		end
-		frame:Show()
-		ConfigureAuraAnimation(frame, aura)
-		if durationObject and frame.cooldown and frame.cooldown.SetCooldownFromDurationObject then
-			frame.cooldown:ClearAllPoints()
-			frame.cooldown:SetAllPoints(frame)
-			frame.cooldown:SetHideCountdownNumbers(aura.showTimer == false or IsReadableNumber(remaining) or cdmText ~= nil)
-			local ok = pcall(frame.cooldown.SetCooldownFromDurationObject, frame.cooldown, durationObject)
-			if ok then
-				frame.cooldown:Show()
-			end
-		elseif cdmState and cdmState.startTime ~= nil and frame.cooldown and frame.cooldown.SetCooldown then
-			pcall(frame.cooldown.SetCooldown, frame.cooldown, cdmState.startTime, cdmState.duration or 0, cdmState.modRate or 1)
-			frame.cooldown:SetHideCountdownNumbers(aura.showTimer == false)
-			frame.cooldown:Show()
-		else
-			frame.cooldown:Hide()
-		end
-		if aura.showTimer ~= false and IsReadableNumber(remaining) then
-			frame.timer:SetFont(STANDARD_TEXT_FONT, aura.timerSize or 44, "OUTLINE")
-			frame.timer:SetText(FormatTime(remaining))
-			if SafeLessEqual(remaining, 5) then
-				frame.timer:SetTextColor(1, 0.2, 0.15)
-			else
-				frame.timer:SetTextColor(1, 1, 1)
-			end
-			frame.timer:Show()
-		elseif aura.showTimer ~= false and cdmText then
-			frame.timer:SetFont(STANDARD_TEXT_FONT, aura.timerSize or 44, "OUTLINE")
-			frame.timer:SetText(cdmText)
-			frame.timer:SetTextColor(1, 1, 1)
-			frame.timer:Show()
-		else
-			frame.timer:Hide()
-		end
-		if frame.cooldown then
-			frame.cooldown:SetHideCountdownNumbers(aura.showTimer == false or IsReadableNumber(remaining) or cdmText ~= nil)
-			if aura.showTimer == false then frame.cooldown:Hide() end
-		end
-	else
-		frame.animation:Stop()
-		frame.animationKey = nil
-		frame.cooldown:Hide()
-		frame.timer:Hide()
-		frame:Hide()
-	end
-
-	return active
-end
-
-local function UpdateDisplay()
-	if not db then
+local function UpdateOneAura(index, sourceAura)
+	if previewing and index ~= previewKey then
+		if auraFrames[index] then auraFrames[index]:Hide() end
 		return
 	end
-	HideBlizzardTrackedBars()
-	if CanUseNativeAuraContainers() then
-		local signature = GetNativeAuraSignature()
-		if not nativeAuraContainerMode or nativeAuraSignature ~= signature then
-			RebuildNativeAuraContainers()
-		end
-		if nativeAuraContainerMode then
-			if testMode then
-				for key, aura in ipairs(db.auras) do
-					UpdateOneAura(key, aura)
-				end
-			else
-				HideLegacyAuraFrames()
-			end
-			return
-		end
-	end
-	for key, aura in ipairs(db.auras) do
-		UpdateOneAura(key, aura)
-	end
+	local aura = GetAuraConfig(index, sourceAura)
+	local frame = auraFrames[index]
+	if not frame then frame = CreateAuraFrame(aura); auraFrames[index] = frame end
+	if aura.enabled == false then frame:Hide(); return end
+	local spellID = tonumber(aura.spellID)
+	if (not spellID or spellID <= 0) and not testMode then frame:Hide(); return end
+	local cdm = not testMode and GetCDMTrackedAura(spellID)
+	local active, remaining, durationObject = false, nil, nil
+	if testMode then active, remaining = true, 8.8
+	elseif cdm then active, durationObject = cdm.active, cdm.durationObject
+		if cdm.startTime and cdm.duration then remaining = cdm.startTime + cdm.duration / (cdm.modRate or 1) - GetTime() end
+	else local auraData = GetPlayerAura(spellID); active, remaining = auraData ~= nil, GetRemaining(auraData) end
+	if remaining and remaining <= 0 then active = false end
+	if not active then frame:Hide(); return end
+	frame:SetSize(aura.size, aura.size)
+	frame:ClearAllPoints(); frame:SetPoint("CENTER", UIParent, "CENTER", aura.x, aura.y)
+	frame.texture:SetTexture(GetTexturePath(aura.texture)); local auraColor = aura.color or { 1, 1, 1, 1 }; frame.texture:SetVertexColor(auraColor[1], auraColor[2], auraColor[3], auraColor[4]); frame.texture:SetAlpha(aura.opacity)
+	frame.visualLayer:ClearAllPoints(); frame.visualLayer:SetAllPoints(frame); frame.visualLayer:SetFrameLevel(frame:GetFrameLevel() + 1)
+	frame.timerLayer:ClearAllPoints(); frame.timerLayer:SetAllPoints(frame); frame.timerLayer:SetFrameLevel(frame:GetFrameLevel() + 10)
+	frame.timer:ClearAllPoints(); frame.timer:SetPoint("CENTER", frame, "CENTER", aura.timerX, aura.timerY)
+	frame.timer:SetFont(GetFontPath(aura.timerFont), aura.timerSize, "OUTLINE")
+	local timerColor = aura.timerColor or { 1, 1, 1, 1 }
+	frame.timer:SetTextColor(timerColor[1], timerColor[2], timerColor[3], timerColor[4])
+	if frame.cooldownText then frame.cooldownText:SetFont(GetFontPath(aura.timerFont), aura.timerSize, "OUTLINE"); frame.cooldownText:ClearAllPoints(); frame.cooldownText:SetPoint("CENTER", frame, "CENTER", aura.timerX, aura.timerY); pcall(frame.cooldownText.SetTextColor, frame.cooldownText, timerColor[1], timerColor[2], timerColor[3], timerColor[4]) end
+	if durationObject and frame.cooldown.SetCooldownFromDurationObject then pcall(frame.cooldown.SetCooldownFromDurationObject, frame.cooldown, durationObject); frame.cooldown:Show() else frame.cooldown:Hide() end
+	if aura.showTimer and remaining then frame.timer:SetText(string.format("%.1f", math.max(0, remaining))); frame.timer:Show() else frame.timer:Hide() end
+	ConfigureAnimation(frame, aura)
+	frame:Show()
 end
 
--- ---------------------------------------------------------------------------
--- 设置面板
--- ---------------------------------------------------------------------------
-local optionsFrame
-local editFrame
-local selectedKey
-local editKey
-local slotButtons = {}
+local function GetNativeSignature()
+	local parts = {}
+	for index, aura in ipairs(db.auras) do parts[#parts + 1] = table.concat({ index, aura.id, aura.spellID, aura.texture, aura.size, aura.x, aura.y, aura.opacity, aura.timerSize, aura.timerX, aura.timerY, aura.timerFont, aura.enabled and 1 or 0, aura.animation, aura.animationDuration, aura.animationScale, table.concat(aura.color or {}, ","), table.concat(aura.timerColor or {}, ",") }, ":") end
+	return table.concat(parts, "|")
+end
+
+local function RebuildNative()
+	if not CanUseNative() then return false end
+	if InCombatLockdown and InCombatLockdown() then rebuildPending = true; return false end
+	ClearNative()
+	local built = false
+	for index, aura in ipairs(db.auras) do if BuildNative(index, GetAuraConfig(index, aura)) then built = true end end
+	nativeMode, nativeSignature, rebuildPending = built, GetNativeSignature(), false
+	return built
+end
+
+UpdateDisplay = function()
+	if not db then return end
+	HideBlizzardBars()
+	if testMode or previewing then
+		if nativeMode then ClearNative() end
+		for index, aura in ipairs(db.auras) do UpdateOneAura(index, aura) end
+		return
+	end
+	if CanUseNative() then
+		local signature = GetNativeSignature()
+		if not nativeMode or nativeSignature ~= signature then RebuildNative() end
+		if nativeMode then for _, frame in pairs(auraFrames) do frame:Hide() end; return end
+	end
+	for index, aura in ipairs(db.auras) do UpdateOneAura(index, aura) end
+end
 
 local function AddBackdrop(frame)
-	frame:SetBackdrop({
-		bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-		edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-		tile = true,
-		tileSize = 32,
-		edgeSize = 32,
-		insets = { left = 8, right = 8, top = 8, bottom = 8 },
-	})
+	frame:SetBackdrop({ bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background", edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border", tile = true, tileSize = 32, edgeSize = 32, insets = { left = 8, right = 8, top = 8, bottom = 8 } })
 	frame:SetBackdropColor(0.05, 0.05, 0.08, 1)
 end
 
 local function MakeButton(parent, text, width)
 	local button = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
-	button:SetSize(width or 100, 22)
-	button:SetText(text)
-	return button
+	button:SetSize(width or 90, 22); button:SetText(text); return button
 end
 
-local function RefreshGrid()
+local function StopPreview()
+	previewing, previewKey, previewDraft = false, nil, nil
+	UpdateDisplay()
+end
+
+local function ShowAuraContextMenu(button)
+	if not MenuUtil or not MenuUtil.CreateContextMenu then return end
+	local key, aura = button.auraKey, db.auras[button.auraKey]
+	if not aura then return end
+	MenuUtil.CreateContextMenu(button, function(_, menu)
+		menu:CreateTitle(aura.name or ("Aura " .. key))
+		menu:CreateButton("复制", function() auraClipboard = CopyTable(aura); auraClipboardSource = key end)
+		menu:CreateButton("粘贴副本", function()
+			if not auraClipboard then return end
+			local copy = CopyTable(auraClipboard); copy.id = NextAuraID(); copy.name = MakeUniqueAuraName(copy.name); copy.selected = false
+			table.insert(db.auras, key + 1, copy); selectedKey = key + 1; EnsureDatabase(); SaveCurrentDatabase(); RefreshGrid(); UpdateDisplay()
+		end)
+		menu:CreateButton("移动到此处", function()
+			if not auraClipboardSource or auraClipboardSource == key then return end
+			local moving = table.remove(db.auras, auraClipboardSource); local target = key
+			if auraClipboardSource < key then target = target - 1 end
+			table.insert(db.auras, target, moving); selectedKey = target; auraClipboardSource = nil; SaveCurrentDatabase(); RefreshGrid(); UpdateDisplay()
+		end)
+		menu:CreateButton(aura.enabled == false and "启用" or "隐藏", function() aura.enabled = aura.enabled == false; SaveCurrentDatabase(); RefreshGrid(); UpdateDisplay() end)
+	end)
+end
+
+RefreshGrid = function()
 	if not optionsFrame then return end
-	for _, button in pairs(slotButtons) do
-		button:Hide()
-	end
-
-	for index, aura in ipairs(db.auras) do
-		local button = slotButtons[index]
+	optionsFrame.buttons = optionsFrame.buttons or {}
+	for _, button in pairs(optionsFrame.buttons) do button:Hide() end
+	local ordered = {}
+	for index, aura in ipairs(db.auras) do if aura.enabled ~= false then ordered[#ordered + 1] = { index = index, aura = aura } end end
+	local enabledCount = #ordered
+	for index, aura in ipairs(db.auras) do if aura.enabled == false then ordered[#ordered + 1] = { index = index, aura = aura } end end
+	if not optionsFrame.enabledLabel then optionsFrame.enabledLabel = optionsFrame.grid:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"); optionsFrame.enabledLabel:SetPoint("TOPLEFT", 4, -2); optionsFrame.hiddenLabel = optionsFrame.grid:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"); optionsFrame.hiddenLabel:SetPoint("TOPLEFT", 4, -150) end
+	optionsFrame.enabledLabel:SetText("已启用"); optionsFrame.hiddenLabel:SetText("已隐藏")
+	for position, entry in ipairs(ordered) do
+		local key, aura = entry.index, entry.aura
+		local button = optionsFrame.buttons[key]
 		if not button then
-			button = CreateFrame("Button", nil, optionsFrame.gridParent, "BackdropTemplate")
-			button:SetSize(72, 64)
+			button = CreateFrame("Button", nil, optionsFrame.grid, "BackdropTemplate"); button:SetSize(72, 64)
 			button:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8", edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 1 })
-			button:SetBackdropColor(0.04, 0.04, 0.06, 0.85)
-			button.texture = button:CreateTexture(nil, "ARTWORK")
-			button.texture:SetAllPoints(button)
-			button.texture:SetTexCoord(0.05, 0.95, 0.05, 0.95)
-			button.check = CreateFrame("CheckButton", nil, button, "UICheckButtonTemplate")
-			button.check:SetSize(20, 20)
-			button.check:SetPoint("TOPLEFT", button, "TOPLEFT", -4, 4)
-			button.check:SetScript("OnClick", function(self)
-				local aura = db.auras[self:GetParent().auraKey]
-				if aura then aura.selected = self:GetChecked() and true or false end
-			end)
-			button.label = button:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-			button.label:SetPoint("BOTTOMLEFT", button, "BOTTOMLEFT", 2, 2)
-			button.label:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -2, 2)
-			button.label:SetJustifyH("CENTER")
-			button.label:SetWordWrap(false)
-			button:SetScript("OnClick", function(self)
-				selectedKey = self.auraKey
-				RefreshGrid()
-			end)
-			button:SetScript("OnDoubleClick", function(self)
-				if self.auraKey and optionsFrame.openEdit then
-					optionsFrame.openEdit(self.auraKey)
-				end
-			end)
-			slotButtons[index] = button
+			button.texture = button:CreateTexture(nil, "ARTWORK"); button.texture:SetAllPoints(button); button.texture:SetTexCoord(0.05, 0.95, 0.05, 0.95)
+			button.label = button:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"); button.label:SetPoint("BOTTOMLEFT", 2, 2); button.label:SetPoint("BOTTOMRIGHT", -2, 2); button.label:SetJustifyH("CENTER"); button.label:SetWordWrap(false)
+			button.check = CreateFrame("CheckButton", nil, button, "UICheckButtonTemplate"); button.check:SetSize(20, 20); button.check:SetPoint("TOPLEFT", -4, 4)
+			button.check:SetScript("OnClick", function(self) local item = db.auras[self:GetParent().auraKey]; if item then item.selected = self:GetChecked() and true or false end end)
+			button:SetScript("OnClick", function(self, mouseButton) if mouseButton ~= "RightButton" then selectedKey = self.auraKey; RefreshGrid() end end)
+			button:SetScript("OnDoubleClick", function(self) if optionsFrame.openEdit then optionsFrame.openEdit(self.auraKey) end end)
+			button:RegisterForClicks("LeftButtonUp", "RightButtonUp"); button:SetScript("OnMouseUp", function(self, mouseButton) if mouseButton == "RightButton" then ShowAuraContextMenu(self) end end)
+			optionsFrame.buttons[key] = button
 		end
-
-		button.auraKey = index
-		button.check:SetChecked(aura.selected == true)
-		button.texture:SetTexture(GetTexturePath(aura.texture))
-		button.texture:SetBlendMode("BLEND")
-		button.label:SetText(aura.name or ("光环" .. index))
-		local row = math.floor((index - 1) / 7)
-		local column = (index - 1) % 7
-		button:ClearAllPoints()
-		button:SetPoint("TOPLEFT", optionsFrame.gridParent, "TOPLEFT", 4 + column * 80, -4 - row * 72)
-		if index == selectedKey then
-			button:SetBackdropBorderColor(1, 0.82, 0.15, 1)
-		else
-			button:SetBackdropBorderColor(0.3, 0.3, 0.3, 0.8)
-		end
-		button:Show()
+		button.auraKey = key; button.check:SetChecked(aura.selected == true); button.texture:SetTexture(GetTexturePath(aura.texture)); button.label:SetText(aura.name)
+		local localPosition = position > enabledCount and position - enabledCount or position
+		local row, column = math.floor((localPosition - 1) / 7), (localPosition - 1) % 7
+		button:ClearAllPoints(); button:SetPoint("TOPLEFT", optionsFrame.grid, 4 + column * 80, (position > enabledCount and -170 or -22) - row * 72)
+		button:SetAlpha(aura.enabled == false and 0.45 or 1); button:SetBackdropBorderColor(key == selectedKey and 1 or 0.3, key == selectedKey and 0.82 or 0.3, key == selectedKey and 0.15 or 0.3, 1); button:Show()
 	end
+end
+
+local function RefreshPreview(frame)
+	if not frame or not frame.draft then return end
+	local draft = frame.draft
+	frame.previewHost:SetSize(draft.size, draft.size); frame.previewHost:ClearAllPoints(); frame.previewHost:SetPoint("CENTER", frame.previewArea, "CENTER", draft.x, draft.y)
+	frame.previewVisual:SetAllPoints(frame.previewHost); frame.previewVisual:SetAlpha(draft.opacity); frame.previewHost.texture:SetTexture(GetTexturePath(draft.texture)); frame.previewHost.texture:SetVertexColor(unpack(draft.color or { 1, 1, 1, 1 }))
+	frame.previewTimer:SetPoint("CENTER", frame.previewHost, "CENTER", draft.timerX, draft.timerY); frame.previewTimer:SetFont(GetFontPath(draft.timerFont), draft.timerSize, "OUTLINE"); frame.previewTimer:SetText("8.8"); frame.previewTimer:SetTextColor(unpack(draft.timerColor or { 1, 1, 1, 1 })); frame.previewTimer:SetShown(draft.showTimer ~= false)
+	local signature = table.concat({ draft.animation, draft.animationDuration, draft.animationScale, draft.mirrorX and 1 or 0, draft.mirrorY and 1 or 0 }, ":")
+	if frame.previewAnimationSignature ~= signature then
+		frame.previewAnimationSignature = signature; frame.previewAnimation:Stop(); frame.previewAnimation:RemoveAnimations(); local duration = math.max(0.2, draft.animationDuration or 2.4)
+		if draft.animation == "rotate" or draft.animation == "spinFade" then local anim = frame.previewAnimation:CreateAnimation("Rotation"); anim:SetDegrees(360); anim:SetDuration(duration) end
+		if draft.animation == "fade" or draft.animation == "spinFade" then local anim = frame.previewAnimation:CreateAnimation("Alpha"); anim:SetFromAlpha(0.2); anim:SetToAlpha(1); anim:SetDuration(duration / 2); local back = frame.previewAnimation:CreateAnimation("Alpha"); back:SetFromAlpha(1); back:SetToAlpha(0.2); back:SetDuration(duration / 2); back:SetOrder(2) end
+		if draft.animation == "pulse" then local anim = frame.previewAnimation:CreateAnimation("Scale"); anim:SetScale(draft.animationScale, draft.animationScale); anim:SetDuration(duration / 2); local back = frame.previewAnimation:CreateAnimation("Scale"); back:SetScale(1 / draft.animationScale, 1 / draft.animationScale); back:SetDuration(duration / 2); back:SetOrder(2) end
+		if draft.animation == "stretch" then local anim = frame.previewAnimation:CreateAnimation("Scale"); anim:SetScale(draft.animationScale, 1); anim:SetDuration(duration / 2); local back = frame.previewAnimation:CreateAnimation("Scale"); back:SetScale(1 / draft.animationScale, 1); back:SetDuration(duration / 2); back:SetOrder(2) end
+		if draft.animation ~= "none" then frame.previewAnimation:SetLooping("REPEAT"); frame.previewAnimation:Play() end
+	end
+	if frame.livePreview then previewDraft = CopyTable(draft); UpdateDisplay() end
+end
+
+local function CreateTextureGallery()
+	if not editFrame then return end
+	if editFrame.gallery then editFrame.gallery:SetShown(not editFrame.gallery:IsShown()); return end
+	local gallery = CreateFrame("Frame", "NSATextureGallery", UIParent, "BackdropTemplate"); gallery:SetSize(520, 430); gallery:SetPoint("CENTER"); gallery:SetFrameStrata("TOOLTIP"); gallery:SetMovable(true); gallery:EnableMouse(true); gallery:RegisterForDrag("LeftButton"); gallery:SetScript("OnDragStart", gallery.StartMoving); gallery:SetScript("OnDragStop", gallery.StopMovingOrSizing); AddBackdrop(gallery)
+	local title = gallery:CreateFontString(nil, "OVERLAY", "GameFontNormal"); title:SetPoint("TOP", 0, -12); title:SetText("TGA 图库")
+	local close = CreateFrame("Button", nil, gallery, "UIPanelCloseButton"); close:SetPoint("TOPRIGHT", -4, -4); close:SetScript("OnClick", function() gallery:Hide() end)
+	local scroll = CreateFrame("ScrollFrame", nil, gallery, "UIPanelScrollFrameTemplate"); scroll:SetPoint("TOPLEFT", 16, -38); scroll:SetPoint("BOTTOMRIGHT", -34, 16)
+	local child = CreateFrame("Frame", nil, scroll); child:SetSize(450, 0); scroll:SetScrollChild(child)
+	gallery.textureGroups = {}
+	local function LayoutTextureGroups()
+		local cursorY = 0
+		for _, entry in ipairs(gallery.textureGroups) do
+			entry.label:SetText((entry.expanded and "[-] " or "[+] ") .. entry.name .. " (" .. entry.count .. ")")
+			entry.section:ClearAllPoints(); entry.section:SetPoint("TOPLEFT", child, 0, -cursorY)
+			entry.body:ClearAllPoints(); entry.body:SetPoint("TOPLEFT", child, 0, -(cursorY + 26)); entry.body:SetShown(entry.expanded)
+			local height = entry.expanded and entry.body:GetHeight() or 0
+			cursorY = cursorY + 26 + height + 8
+		end
+		child:SetHeight(math.max(1, cursorY))
+	end
+	for groupIndex, group in ipairs(TEXTURE_GROUPS) do
+		local files = group.files()
+		local section = CreateFrame("Button", nil, child, "BackdropTemplate"); section:SetSize(450, 24); section:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8" }); section:SetBackdropColor(0.12, 0.12, 0.16, 1)
+		local sectionLabel = section:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"); sectionLabel:SetPoint("LEFT", 8, 0); sectionLabel:SetJustifyH("LEFT")
+		local groupBody = CreateFrame("Frame", nil, child); groupBody:SetSize(450, math.max(1, math.ceil(#files / 6) * 76))
+		local entry = { section = section, body = groupBody, label = sectionLabel, expanded = true, name = group.name, count = #files }
+		gallery.textureGroups[groupIndex] = entry
+		section:SetScript("OnClick", function() entry.expanded = not entry.expanded; LayoutTextureGroups() end)
+		for number, fileName in ipairs(files) do
+			local button = CreateFrame("Button", nil, groupBody, "BackdropTemplate"); button:SetSize(68, 68); button:SetPoint("TOPLEFT", ((number - 1) % 6) * 75, -math.floor((number - 1) / 6) * 76); button:SetBackdrop({ bgFile = "Interface\\Buttons\\WHITE8X8", edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 1 }); button:SetBackdropColor(0.03, 0.03, 0.04, 0.9)
+			local texture = button:CreateTexture(nil, "ARTWORK"); texture:SetAllPoints(button); texture:SetTexture(GetTexturePath(group.folder .. fileName)); texture:SetTexCoord(0.05, 0.95, 0.05, 0.95)
+			local label = button:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall"); label:SetPoint("BOTTOM", 0, 1); label:SetText(fileName:gsub("%.tga$", ""))
+			button:SetScript("OnClick", function() editFrame.draft.texture = group.folder .. fileName; editFrame.texturePath:SetText(editFrame.draft.texture); editFrame.textureName:SetText(editFrame.draft.texture); RefreshPreview(editFrame); gallery:Hide() end)
+		end
+	end
+	LayoutTextureGroups()
+	editFrame.gallery = gallery; gallery:Show()
 end
 
 local function CloseEdit()
-	if editFrame then
-		editFrame:Hide()
-	end
+	if editFrame then if previewing and previewKey == editKey then testMode = false; editFrame.livePreview = false; editFrame.test:SetText("测试预览"); StopPreview() end; editFrame:Hide() end
 end
 
 local function OpenEdit(key)
-	local aura = db.auras[key]
-	if not aura then return end
+	local aura = db.auras[key]; if not aura then return end
 	editKey = key
-
 	if not editFrame then
-		local frame = CreateFrame("Frame", "NSAEditFrame", UIParent, "BackdropTemplate")
-		frame:SetSize(540, 640)
-		frame:SetPoint("CENTER")
-		frame:SetFrameStrata("DIALOG")
-		frame:SetMovable(true)
-		frame:EnableMouse(true)
-		frame:RegisterForDrag("LeftButton")
-		frame:SetScript("OnDragStart", frame.StartMoving)
-		frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
-		AddBackdrop(frame)
-		tinsert(UISpecialFrames, "NSAEditFrame")
-		editFrame = frame
-
-		local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-		title:SetPoint("TOP", frame, "TOP", 0, -14)
-		title:SetText("特效编辑器")
-
-		local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
-		close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -4, -4)
-		close:SetScript("OnClick", CloseEdit)
-
-		frame.previewHost = CreateFrame("Frame", nil, frame)
-		frame.previewHost:SetSize(150, 150)
-		frame.previewArea = CreateFrame("Frame", nil, frame)
-		frame.previewArea:SetSize(190, 190)
-		frame.previewArea:SetPoint("TOPLEFT", frame, "TOPLEFT", 2, -42)
-		frame.previewHost:SetPoint("CENTER", frame.previewArea, "CENTER")
-		frame.previewHost.animation = frame.previewHost:CreateAnimationGroup()
-		frame.preview = frame.previewHost:CreateTexture(nil, "ARTWORK")
-		frame.preview:SetAllPoints(frame.previewHost)
-		frame.preview:SetBlendMode("ADD")
-		frame.previewHost.texture = frame.preview
-		frame.previewTimer = frame.previewHost:CreateFontString(nil, "OVERLAY", "NumberFont_Outline_Huge")
-		frame.previewTimer:SetPoint("CENTER", frame.previewHost, "CENTER")
-		frame.previewTimer:SetText("8.8")
-
-		frame.prevTexture = MakeButton(frame, "<", 30)
-		frame.prevTexture:SetPoint("TOPLEFT", frame, "TOPLEFT", 22, -190)
-		frame.nextTexture = MakeButton(frame, ">", 30)
-		frame.nextTexture:SetPoint("LEFT", frame.prevTexture, "RIGHT", 4, 0)
-		frame.textureName = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-		frame.textureName:SetPoint("LEFT", frame.nextTexture, "RIGHT", 8, 0)
-		frame.textureName:SetWidth(180)
-		frame.textureName:SetJustifyH("LEFT")
-
-		local function AddLabel(y, text, x)
-			local label = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-			label:SetPoint("TOPLEFT", frame, "TOPLEFT", x or 190, y)
-			label:SetText(text)
-			return label
-		end
-
-		local function AddEdit(y, width, x)
-			local edit = CreateFrame("EditBox", nil, frame, "InputBoxTemplate")
-			edit:SetSize(width or 70, 22)
-			edit:SetAutoFocus(false)
-			edit:SetMaxLetters(180)
-			edit:SetPoint("TOPLEFT", frame, "TOPLEFT", x or 280, y)
-			return edit
-		end
-
-		AddLabel(-26, "光环名称：")
-		frame.name = AddEdit(-26, 190)
-		AddLabel(-56, "法术 ID：")
-		frame.spellID = AddEdit(-56, 90)
-		AddLabel(-86, "位置 X：")
-		frame.posX = AddEdit(-86, 60, 440)
-		AddLabel(-116, "位置 Y：")
-		frame.posY = AddEdit(-116, 60, 440)
-		AddLabel(-146, "光环大小：")
-		frame.size = AddEdit(-146, 60, 440)
-		AddLabel(-176, "不透明度：")
-		frame.opacity = AddEdit(-176, 60, 440)
-		AddLabel(-206, "倒计时字号：")
-		frame.timerSize = AddEdit(-206, 60, 440)
-		AddLabel(-236, "倒计时 X：")
-		frame.timerX = AddEdit(-236, 60, 440)
-		AddLabel(-266, "倒计时 Y：")
-		frame.timerY = AddEdit(-266, 60, 440)
-		AddLabel(-296, "贴图路径：")
-		frame.texturePath = AddEdit(-296, 190)
-
-		local hint = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-		hint:SetPoint("TOPLEFT", frame, "TOPLEFT", 190, -324)
-		hint:SetText("例如：Media\\MyAura.tga 或 Auras\\Aura1.tga")
-		hint:SetTextColor(0.65, 0.65, 0.65)
-
-		frame.timer = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
-		frame.timer:SetPoint("TOPLEFT", frame, "TOPLEFT", 190, -352)
-		frame.timer:SetText("显示倒计时")
-		AddLabel(-416, "动画形式：")
-		frame.animation = MakeButton(frame, ANIMATION_NAMES.none, 128)
-		frame.animation:SetPoint("TOPLEFT", frame, "TOPLEFT", 280, -410)
-		AddLabel(-446, "动画周期：")
-		frame.animationDuration = AddEdit(-446, 65, 280)
-		AddLabel(-446, "变形倍率：", 360)
-		frame.animationScale = AddEdit(-446, 65, 440)
-
-		AddLabel(-476, "光环颜色：")
-		frame.colorButton = MakeButton(frame, "选择颜色", 90)
-		frame.colorButton:SetPoint("TOPLEFT", frame, "TOPLEFT", 280, -470)
-		frame.colorSwatch = frame:CreateTexture(nil, "ARTWORK")
-		frame.colorSwatch:SetSize(20, 20)
-		frame.colorSwatch:SetPoint("LEFT", frame.colorButton, "RIGHT", 6, 0)
-		frame.mirrorX = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
-		frame.mirrorX:SetPoint("TOPLEFT", frame, "TOPLEFT", 190, -504)
-		frame.mirrorX:SetText("水平翻转")
-		frame.mirrorY = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
-		frame.mirrorY:SetPoint("LEFT", frame.mirrorX, "RIGHT", 20, 0)
-		frame.mirrorY:SetText("垂直翻转")
-
-		frame.test = MakeButton(frame, "测试预览", 100)
-		frame.test:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 22, 18)
-		frame.save = MakeButton(frame, "保存", 80)
-		frame.save:SetPoint("LEFT", frame.test, "RIGHT", 6, 0)
-		frame.cancel = MakeButton(frame, "取消", 80)
-		frame.cancel:SetPoint("LEFT", frame.save, "RIGHT", 6, 0)
-
-		local function AddSlider(name, x, y, minValue, maxValue, step, key, editField)
-			local slider = CreateFrame("Slider", name, frame, "OptionsSliderTemplate")
-			slider:SetSize(140, 24)
-			slider:SetPoint("TOPLEFT", frame, "TOPLEFT", x, y)
-			slider:SetMinMaxValues(minValue, maxValue)
-			slider:SetValueStep(step)
-			slider:SetObeyStepOnDrag(true)
-			slider:SetScript("OnValueChanged", function(self, value)
-				if not editFrame.draft then return end
-				editFrame.draft[key] = value
-				if editField then editField:SetText(tostring(value)) end
-				RefreshPreview(editFrame)
-			end)
-			return slider
-		end
-		frame.xSlider = AddSlider("NSAXSlider", 280, -86, -1000, 1000, 1, "x", frame.posX)
-		frame.ySlider = AddSlider("NSAYSlider", 280, -116, -1000, 1000, 1, "y", frame.posY)
-		frame.sizeSlider = AddSlider("NSASizeSlider", 280, -146, 32, 512, 1, "size", frame.size)
-		frame.opacitySlider = AddSlider("NSAOpacitySlider", 280, -176, 0.05, 1, 0.05, "opacity", frame.opacity)
-
-		frame.prevTexture:SetScript("OnClick", function()
-			local draft = editFrame.draft
-			local number = tonumber((draft.texture or "Aura1.tga"):match("(%d+)")) or 1
-			number = (number - 2 + MAX_TEXTURES) % MAX_TEXTURES + 1
-			draft.texture = "Aura" .. number .. ".tga"
-			editFrame.preview:SetTexture(GetTexturePath(draft.texture))
-			editFrame.textureName:SetText(draft.texture)
-			editFrame.texturePath:SetText(draft.texture)
-		end)
-		frame.nextTexture:SetScript("OnClick", function()
-			local draft = editFrame.draft
-			local number = tonumber((draft.texture or "Aura1.tga"):match("(%d+)")) or 1
-			number = number % MAX_TEXTURES + 1
-			draft.texture = "Aura" .. number .. ".tga"
-			editFrame.textureName:SetText(draft.texture)
-			editFrame.texturePath:SetText(draft.texture)
-			RefreshPreview(editFrame)
-		end)
-		frame.animation:SetScript("OnClick", function()
-			local draft = editFrame.draft
-			local current = 1
-			for i, value in ipairs(ANIMATION_ORDER) do
-				if value == draft.animation then
-					current = i
-					break
-				end
-			end
-			draft.animation = ANIMATION_ORDER[current % #ANIMATION_ORDER + 1]
-			frame.animation:SetText(ANIMATION_NAMES[draft.animation])
-			RefreshPreview(editFrame)
-		end)
-		frame.animationDuration:SetScript("OnTextChanged", function(self)
-			if editFrame.draft and self:HasFocus() then
-				editFrame.draft.animationDuration = tonumber(self:GetText()) or 2.4
-				RefreshPreview(editFrame)
-			end
-		end)
-		frame.animationScale:SetScript("OnTextChanged", function(self)
-			if editFrame.draft and self:HasFocus() then
-				editFrame.draft.animationScale = tonumber(self:GetText()) or 1.25
-				RefreshPreview(editFrame)
-			end
-		end)
-		local function BindDraftNumber(edit, key, fallback)
-			edit:SetScript("OnTextChanged", function(self)
-				if editFrame.draft and self:HasFocus() then
-					editFrame.draft[key] = tonumber(self:GetText()) or fallback
-					RefreshPreview(editFrame)
-				end
-			end)
-		end
-		BindDraftNumber(frame.posX, "x", 0)
-		BindDraftNumber(frame.posY, "y", 0)
-		BindDraftNumber(frame.size, "size", 128)
-		BindDraftNumber(frame.opacity, "opacity", 1)
-		BindDraftNumber(frame.timerSize, "timerSize", 44)
-		BindDraftNumber(frame.timerX, "timerX", 0)
-		BindDraftNumber(frame.timerY, "timerY", 0)
-		frame.name:SetScript("OnTextChanged", function(self)
-			if editFrame.draft and self:HasFocus() then
-				editFrame.draft.name = self:GetText()
-				RefreshPreview(editFrame)
-			end
-		end)
-		frame.mirrorX:SetScript("OnClick", function(self)
-			editFrame.draft.mirrorX = self:GetChecked() and true or false
-			RefreshPreview(editFrame)
-		end)
-		frame.mirrorY:SetScript("OnClick", function(self)
-			editFrame.draft.mirrorY = self:GetChecked() and true or false
-			RefreshPreview(editFrame)
-		end)
-		frame.colorButton:SetScript("OnClick", function()
-			local color = editFrame.draft.color or { 1, 1, 1, 1 }
-			local info = {
-				hasOpacity = true,
-				r = color[1], g = color[2], b = color[3], opacity = color[4],
-				swatchFunc = function()
-					local r, g, b = ColorPickerFrame:GetColorRGB()
-					local a = ColorPickerFrame.GetColorAlpha and ColorPickerFrame:GetColorAlpha() or color[4]
-					editFrame.draft.color = { r, g, b, a }
-					frame.colorSwatch:SetColorTexture(r, g, b, a)
-					RefreshPreview(editFrame)
-				end,
-				cancelFunc = function(previous)
-					if previous then
-						editFrame.draft.color = { previous.r, previous.g, previous.b, previous.opacity or 1 }
-						frame.colorSwatch:SetColorTexture(unpack(editFrame.draft.color))
-						RefreshPreview(editFrame)
-					end
-				end,
-			}
-			if ColorPickerFrame.SetupColorPickerAndShow then
-				ColorPickerFrame:SetupColorPickerAndShow(info)
-			end
-		end)
-		frame.texturePath:SetScript("OnTextChanged", function(self)
-			if editFrame and editFrame.draft and self:HasFocus() then
-				editFrame.draft.texture = NormalizeTexture(self:GetText())
-			editFrame.preview:SetTexture(GetTexturePath(editFrame.draft.texture))
-			editFrame.textureName:SetText(editFrame.draft.texture)
-			RefreshPreview(editFrame)
-			end
-		end)
-		frame.test:SetScript("OnClick", function()
-			testMode = true
-			UpdateDisplay()
-			C_Timer.After(3, function()
-				testMode = false
-				UpdateDisplay()
-			end)
-		end)
+		local frame = CreateFrame("Frame", "NSAEditFrame", UIParent, "BackdropTemplate"); frame:SetSize(540, 640); frame:SetPoint("CENTER"); frame:SetFrameStrata("DIALOG"); frame:SetMovable(true); frame:EnableMouse(true); frame:RegisterForDrag("LeftButton"); frame:SetScript("OnDragStart", frame.StartMoving); frame:SetScript("OnDragStop", frame.StopMovingOrSizing); AddBackdrop(frame); tinsert(UISpecialFrames, "NSAEditFrame"); editFrame = frame
+		local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge"); title:SetPoint("TOP", 0, -14); title:SetText("光环编辑器")
+		local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton"); close:SetPoint("TOPRIGHT", -4, -4); close:SetScript("OnClick", CloseEdit)
+		frame.previewArea = CreateFrame("Frame", nil, frame); frame.previewArea:SetSize(190, 190); frame.previewArea:SetPoint("TOPLEFT", 2, -42)
+		frame.previewHost = CreateFrame("Frame", nil, frame); frame.previewHost:SetSize(150, 150); frame.previewHost:SetPoint("CENTER", frame.previewArea, "CENTER"); frame.previewVisual = CreateFrame("Frame", nil, frame.previewHost); frame.previewVisual:SetAllPoints(frame.previewHost); frame.previewHost.texture = frame.previewVisual:CreateTexture(nil, "ARTWORK"); frame.previewHost.texture:SetAllPoints(frame.previewVisual); frame.previewHost.texture:SetBlendMode("ADD"); frame.previewTimerLayer = CreateFrame("Frame", nil, frame.previewHost); frame.previewTimerLayer:SetAllPoints(frame.previewHost); frame.previewTimerLayer:SetFrameLevel(frame.previewHost:GetFrameLevel() + 10); frame.previewTimer = frame.previewTimerLayer:CreateFontString(nil, "OVERLAY", "NumberFont_Outline_Huge"); frame.previewTimer:SetPoint("CENTER", frame.previewHost, "CENTER"); frame.previewAnimation = frame.previewVisual:CreateAnimationGroup()
+		frame.prevTexture = MakeButton(frame, "<", 30); frame.prevTexture:SetPoint("TOPLEFT", 22, -190); frame.nextTexture = MakeButton(frame, ">", 30); frame.nextTexture:SetPoint("LEFT", frame.prevTexture, "RIGHT", 4, 0); frame.galleryButton = MakeButton(frame, "图库", 62); frame.galleryButton:SetPoint("LEFT", frame.nextTexture, "RIGHT", 6, 0); frame.galleryButton:SetScript("OnClick", CreateTextureGallery); frame.textureName = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"); frame.textureName:SetPoint("LEFT", frame.galleryButton, "RIGHT", 8, 0); frame.textureName:SetWidth(150); frame.textureName:SetJustifyH("LEFT")
+		local function Label(y, text, x) local label = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"); label:SetPoint("TOPLEFT", x or 190, y); label:SetText(text) end
+		local function Edit(y, width, x) local input = CreateFrame("EditBox", nil, frame, "InputBoxTemplate"); input:SetSize(width or 70, 22); input:SetAutoFocus(false); input:SetPoint("TOPLEFT", x or 280, y); return input end
+		Label(-26, "光环名称"); frame.name = Edit(-26, 190); Label(-56, "法术 ID"); frame.spellID = Edit(-56, 90); Label(-86, "X 轴位置"); frame.posX = Edit(-86, 60, 440); Label(-116, "Y 轴位置"); frame.posY = Edit(-116, 60, 440); Label(-146, "光环大小"); frame.size = Edit(-146, 60, 440); Label(-176, "不透明度"); frame.opacity = Edit(-176, 60, 440); Label(-206, "倒计时字号"); frame.timerSize = Edit(-206, 60, 440); Label(-236, "倒计时 X"); frame.timerX = Edit(-236, 60, 440); Label(-266, "倒计时 Y"); frame.timerY = Edit(-266, 60, 440); Label(-296, "纹理路径"); frame.texturePath = Edit(-296, 190)
+		frame.timer = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate"); frame.timer:SetPoint("TOPLEFT", 190, -352); frame.timer:SetText(""); Label(-356, "勾选后显示倒计时数字", 220); Label(-326, "倒计时字体"); frame.timerFont = CreateFrame("Frame", nil, frame, "UIDropDownMenuTemplate"); frame.timerFont:SetPoint("TOPLEFT", 260, -320); UIDropDownMenu_SetWidth(frame.timerFont, 150); UIDropDownMenu_Initialize(frame.timerFont, function(self) for _, entry in ipairs(fontOptions) do local info = UIDropDownMenu_CreateInfo(); info.text = entry.name or entry.key; info.checked = editFrame.draft and editFrame.draft.timerFont == entry.key; info.func = function() if editFrame.draft then editFrame.draft.timerFont = entry.key; UIDropDownMenu_SetText(self, entry.name or entry.key); RefreshPreview(editFrame) end end; UIDropDownMenu_AddButton(info) end end); Label(-416, "动画形式"); frame.animation = CreateFrame("Frame", nil, frame, "UIDropDownMenuTemplate"); frame.animation:SetPoint("TOPLEFT", 260, -400); UIDropDownMenu_SetWidth(frame.animation, 150); UIDropDownMenu_Initialize(frame.animation, function(self) for _, value in ipairs(ANIMATION_ORDER) do local info = UIDropDownMenu_CreateInfo(); info.text = ANIMATION_NAMES[value]; info.checked = editFrame.draft and editFrame.draft.animation == value; info.func = function() if editFrame.draft then editFrame.draft.animation = value; UIDropDownMenu_SetText(self, ANIMATION_NAMES[value]); RefreshPreview(editFrame) end end; UIDropDownMenu_AddButton(info) end end); Label(-446, "动画时长"); frame.animationDuration = Edit(-446, 65, 280); Label(-446, "动画缩放", 360); frame.animationScale = Edit(-446, 65, 440); Label(-476, "光环颜色"); frame.colorButton = MakeButton(frame, "选择颜色", 80); frame.colorButton:SetPoint("TOPLEFT", 280, -470); frame.colorSwatch = frame:CreateTexture(nil, "ARTWORK"); frame.colorSwatch:SetSize(20, 20); frame.colorSwatch:SetPoint("LEFT", frame.colorButton, "RIGHT", 6, 0); Label(-504, "倒计时颜色"); frame.timerColorButton = MakeButton(frame, "选择颜色", 80); frame.timerColorButton:SetPoint("TOPLEFT", 280, -498); frame.timerColorSwatch = frame:CreateTexture(nil, "ARTWORK"); frame.timerColorSwatch:SetSize(20, 20); frame.timerColorSwatch:SetPoint("LEFT", frame.timerColorButton, "RIGHT", 6, 0)
+		frame.test = MakeButton(frame, "测试预览", 100); frame.test:SetPoint("BOTTOMLEFT", 22, 18); frame.save = MakeButton(frame, "保存", 80); frame.save:SetPoint("LEFT", frame.test, "RIGHT", 6, 0); frame.cancel = MakeButton(frame, "关闭", 80); frame.cancel:SetPoint("LEFT", frame.save, "RIGHT", 6, 0)
+		local function Slider(name, y, minValue, maxValue, step, key, input) local slider = CreateFrame("Slider", name, frame, "OptionsSliderTemplate"); slider:SetSize(140, 24); slider:SetPoint("TOPLEFT", 280, y); slider:SetMinMaxValues(minValue, maxValue); slider:SetValueStep(step); slider:SetObeyStepOnDrag(true); slider:SetScript("OnValueChanged", function(self, value) if editFrame.draft then editFrame.draft[key] = value; input:SetText(tostring(value)); RefreshPreview(editFrame) end end); return slider end
+		frame.xSlider = Slider("NSAXSlider", -86, -1000, 1000, 1, "x", frame.posX); frame.ySlider = Slider("NSAYSlider", -116, -1000, 1000, 1, "y", frame.posY); frame.sizeSlider = Slider("NSASizeSlider", -146, 32, 512, 1, "size", frame.size); frame.opacitySlider = Slider("NSAOpacitySlider", -176, 0.05, 1, 0.05, "opacity", frame.opacity); frame.timerSizeSlider = Slider("NSATimerSizeSlider", -206, 10, 96, 1, "timerSize", frame.timerSize); frame.timerXSlider = Slider("NSATimerXSlider", -236, -300, 300, 1, "timerX", frame.timerX); frame.timerYSlider = Slider("NSATimerYSlider", -266, -300, 300, 1, "timerY", frame.timerY)
+		local function Bind(input, key, fallback, slider) input:SetScript("OnTextChanged", function(self) if editFrame.draft and self:HasFocus() then local value = tonumber(self:GetText()) or fallback; editFrame.draft[key] = value; if slider then slider:SetValue(value) end; RefreshPreview(editFrame) end end) end
+		Bind(frame.posX, "x", 0, frame.xSlider); Bind(frame.posY, "y", 0, frame.ySlider); Bind(frame.size, "size", 160, frame.sizeSlider); Bind(frame.opacity, "opacity", 1, frame.opacitySlider); Bind(frame.timerSize, "timerSize", 44, frame.timerSizeSlider); Bind(frame.timerX, "timerX", 0, frame.timerXSlider); Bind(frame.timerY, "timerY", 0, frame.timerYSlider)
+		frame.name:SetScript("OnTextChanged", function(self) if editFrame.draft and self:HasFocus() then editFrame.draft.name = self:GetText(); RefreshPreview(editFrame) end end)
+		frame.texturePath:SetScript("OnTextChanged", function(self) if editFrame.draft and self:HasFocus() then editFrame.draft.texture = NormalizeTexture(self:GetText()); frame.textureName:SetText(editFrame.draft.texture); RefreshPreview(editFrame) end end)
+		frame.prevTexture:SetScript("OnClick", function() local n = tonumber((editFrame.draft.texture or "Aura1.tga"):match("(%d+)")) or 1; n = (n - 2 + MAX_TEXTURES) % MAX_TEXTURES + 1; editFrame.draft.texture = "Aura" .. n .. ".tga"; frame.texturePath:SetText(editFrame.draft.texture); RefreshPreview(frame) end)
+		frame.nextTexture:SetScript("OnClick", function() local n = tonumber((editFrame.draft.texture or "Aura1.tga"):match("(%d+)")) or 1; n = n % MAX_TEXTURES + 1; editFrame.draft.texture = "Aura" .. n .. ".tga"; frame.texturePath:SetText(editFrame.draft.texture); RefreshPreview(frame) end)
+		frame.animationDuration:SetScript("OnTextChanged", function(self) if editFrame.draft and self:HasFocus() then editFrame.draft.animationDuration = tonumber(self:GetText()) or 2.4; RefreshPreview(frame) end end); frame.animationScale:SetScript("OnTextChanged", function(self) if editFrame.draft and self:HasFocus() then editFrame.draft.animationScale = tonumber(self:GetText()) or 1.25; RefreshPreview(frame) end end)
+		local function ColorPicker(button, swatch, key) button:SetScript("OnClick", function() local color = editFrame.draft[key] or { 1, 1, 1, 1 }; local info = { hasOpacity = true, r = color[1], g = color[2], b = color[3], opacity = color[4], swatchFunc = function() local r, g, b = ColorPickerFrame:GetColorRGB(); local a = ColorPickerFrame.GetColorAlpha and ColorPickerFrame:GetColorAlpha() or color[4]; editFrame.draft[key] = { r, g, b, a }; swatch:SetColorTexture(r, g, b, a); RefreshPreview(frame) end }; if ColorPickerFrame.SetupColorPickerAndShow then ColorPickerFrame:SetupColorPickerAndShow(info) end end) end
+		ColorPicker(frame.colorButton, frame.colorSwatch, "color"); ColorPicker(frame.timerColorButton, frame.timerColorSwatch, "timerColor")
+		frame.test:SetScript("OnClick", function() if testMode then testMode = false; frame.livePreview = false; frame.test:SetText("测试预览"); StopPreview(); return end; frame.livePreview = true; previewing, previewKey, previewDraft, testMode = true, editKey, CopyTable(frame.draft), true; frame.test:SetText("停止预览"); UpdateDisplay() end)
+		frame.timer:SetScript("OnClick", function(self) if editFrame.draft then editFrame.draft.showTimer = self:GetChecked() and true or false; RefreshPreview(editFrame) end end)
 		frame.cancel:SetScript("OnClick", CloseEdit)
-		frame.save:SetScript("OnClick", function()
-			local draft = editFrame.draft
-			if not draft then return end
-			draft.spellID = tonumber(frame.spellID:GetText()) or draft.spellID
-			draft.x = tonumber(frame.posX:GetText()) or draft.x or 0
-			draft.y = tonumber(frame.posY:GetText()) or draft.y or 0
-			draft.size = tonumber(frame.size:GetText()) or draft.size or 128
-			draft.opacity = tonumber(frame.opacity:GetText()) or draft.opacity or 1
-			draft.timerSize = tonumber(frame.timerSize:GetText()) or draft.timerSize or 44
-			draft.timerX = tonumber(frame.timerX:GetText()) or draft.timerX or 0
-			draft.timerY = tonumber(frame.timerY:GetText()) or draft.timerY or 0
-			draft.name = frame.name:GetText() or draft.name
-			draft.texture = NormalizeTexture(frame.texturePath:GetText())
-			draft.animationDuration = math.max(0.2, tonumber(frame.animationDuration:GetText()) or draft.animationDuration or 2.4)
-			draft.animationScale = math.max(1, math.min(3, tonumber(frame.animationScale:GetText()) or draft.animationScale or 1.25))
-			draft.mirrorX = frame.mirrorX:GetChecked() and true or false
-			draft.mirrorY = frame.mirrorY:GetChecked() and true or false
-			draft.showTimer = frame.timer:GetChecked() and true or false
-			db.auras[editKey] = draft
-			RefreshGrid()
-			UpdateDisplay()
-			CloseEdit()
-			Print("已保存特效：" .. (draft.name or ""))
-		end)
+		frame.save:SetScript("OnClick", function() local draft = CopyTable(frame.draft); draft.spellID = tonumber(frame.spellID:GetText()) or draft.spellID; draft.texture = NormalizeTexture(frame.texturePath:GetText()); draft.name = frame.name:GetText() or draft.name; draft.animationDuration = math.max(0.2, tonumber(frame.animationDuration:GetText()) or draft.animationDuration); draft.animationScale = math.max(1, math.min(3, tonumber(frame.animationScale:GetText()) or draft.animationScale)); db.auras[editKey] = draft; frame.draft = CopyTable(draft); if previewing and previewKey == editKey then previewDraft = CopyTable(draft) end; EnsureDatabase(); SaveCurrentDatabase(); RefreshGrid(); UpdateDisplay(); Print("已保存：" .. draft.name) end)
 	end
-
-	editFrame.draft = CopyTable(aura)
-	editFrame.preview:SetTexture(GetTexturePath(editFrame.draft.texture))
-	editFrame.textureName:SetText(editFrame.draft.texture)
-	editFrame.name:SetText(editFrame.draft.name or "")
-	editFrame.spellID:SetText(tostring(editFrame.draft.spellID or ""))
-	editFrame.posX:SetText(tostring(editFrame.draft.x or 0))
-	editFrame.posY:SetText(tostring(editFrame.draft.y or 0))
-	editFrame.size:SetText(tostring(editFrame.draft.size or 128))
-	editFrame.opacity:SetText(tostring(editFrame.draft.opacity or 1))
-	editFrame.timerSize:SetText(tostring(editFrame.draft.timerSize or 44))
-	editFrame.timerX:SetText(tostring(editFrame.draft.timerX or 0))
-	editFrame.timerY:SetText(tostring(editFrame.draft.timerY or 0))
-	editFrame.texturePath:SetText(editFrame.draft.texture or "Aura1.tga")
-	editFrame.animation:SetText(ANIMATION_NAMES[editFrame.draft.animation] or ANIMATION_NAMES.none)
-	editFrame.animationDuration:SetText(tostring(editFrame.draft.animationDuration or 2.4))
-	editFrame.animationScale:SetText(tostring(editFrame.draft.animationScale or 1.25))
-	editFrame.colorSwatch:SetColorTexture(unpack(editFrame.draft.color or { 1, 1, 1, 1 }))
-	editFrame.mirrorX:SetChecked(editFrame.draft.mirrorX and true or false)
-	editFrame.mirrorY:SetChecked(editFrame.draft.mirrorY and true or false)
-	editFrame.timer:SetChecked(editFrame.draft.showTimer ~= false)
-	editFrame.sizeSlider:SetValue(editFrame.draft.size or 128)
-	editFrame.opacitySlider:SetValue(editFrame.draft.opacity or 1)
-	editFrame.xSlider:SetValue(editFrame.draft.x or 0)
-	editFrame.ySlider:SetValue(editFrame.draft.y or 0)
-	RefreshPreview(editFrame)
-	editFrame:Show()
+	editFrame.draft = CopyTable(aura); editFrame.name:SetText(editFrame.draft.name); editFrame.spellID:SetText(tostring(editFrame.draft.spellID)); editFrame.posX:SetText(tostring(editFrame.draft.x)); editFrame.posY:SetText(tostring(editFrame.draft.y)); editFrame.size:SetText(tostring(editFrame.draft.size)); editFrame.opacity:SetText(tostring(editFrame.draft.opacity)); editFrame.timerSize:SetText(tostring(editFrame.draft.timerSize)); editFrame.timerX:SetText(tostring(editFrame.draft.timerX)); editFrame.timerY:SetText(tostring(editFrame.draft.timerY)); editFrame.texturePath:SetText(editFrame.draft.texture); editFrame.textureName:SetText(editFrame.draft.texture); UIDropDownMenu_SetText(editFrame.timerFont, GetFontName(editFrame.draft.timerFont)); UIDropDownMenu_SetText(editFrame.animation, ANIMATION_NAMES[editFrame.draft.animation] or ANIMATION_NAMES.none); editFrame.animationDuration:SetText(tostring(editFrame.draft.animationDuration)); editFrame.animationScale:SetText(tostring(editFrame.draft.animationScale)); editFrame.colorSwatch:SetColorTexture(unpack(editFrame.draft.color)); editFrame.timerColorSwatch:SetColorTexture(unpack(editFrame.draft.timerColor)); editFrame.timer:SetChecked(editFrame.draft.showTimer ~= false); editFrame.xSlider:SetValue(editFrame.draft.x); editFrame.ySlider:SetValue(editFrame.draft.y); editFrame.sizeSlider:SetValue(editFrame.draft.size); editFrame.opacitySlider:SetValue(editFrame.draft.opacity); editFrame.timerSizeSlider:SetValue(editFrame.draft.timerSize); editFrame.timerXSlider:SetValue(editFrame.draft.timerX); editFrame.timerYSlider:SetValue(editFrame.draft.timerY); editFrame.test:SetText(testMode and "停止预览" or "测试预览"); RefreshPreview(editFrame); editFrame:Show()
 end
 
 local function CreateTextEdit(parent, x, y, width, value)
-	local edit = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
-	edit:SetSize(width, 22)
-	edit:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
-	edit:SetAutoFocus(false)
-	edit:SetMaxLetters(12)
-	edit:SetText(tostring(value))
-	return edit
-end
-
-local function ImportFromCooldownViewer()
-	if not (C_CooldownViewer and C_CooldownViewer.GetCooldownViewerCategorySet) then
-		Print("冷却管理器 API 不可用。请先进入游戏后再试。")
-		return
-	end
-
-	local existing = {}
-	for _, aura in ipairs(db.auras) do
-		local spellID = tonumber(aura.spellID)
-		if spellID then
-			existing[spellID] = true
-		end
-	end
-
-	local categories = {}
-	if Enum and Enum.CooldownViewerCategory then
-		categories = {
-			Enum.CooldownViewerCategory.TrackedBar,
-			Enum.CooldownViewerCategory.TrackedBuff,
-		}
-	else
-		categories = { 3, 4 }
-	end
-	local count = 0
-	for _, category in ipairs(categories) do
-		local ok, cooldownIDs = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, category, true)
-		if ok and cooldownIDs then
-			for _, cooldownID in ipairs(cooldownIDs) do
-				local okInfo, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, cooldownID)
-				if okInfo and info then
-					local spellID = info.overrideTooltipSpellID or info.overrideSpellID or info.spellID or info.spellId
-					if not spellID and info.overrideSpellId then spellID = info.overrideSpellId end
-					if spellID and not existing[spellID] then
-						existing[spellID] = true
-						local newAura = CreateDefaultAura(spellID)
-		table.insert(db.auras, newAura)
-						count = count + 1
-					end
-				end
-			end
-		end
-	end
-	RefreshGrid()
-	UpdateDisplay()
-	Print("已导入 " .. count .. " 个技能。双击图标可编辑。")
-end
-
-local function AddSpell(spellID)
-	spellID = tonumber(spellID)
-	if not spellID or spellID <= 0 then
-		Print("用法：/nsa add 法术ID，例如 /nsa add 51271")
-		return
-	end
-	for _, aura in ipairs(db.auras) do
-		if tonumber(aura.spellID) == spellID then
-			Print("这个法术已经存在于列表中。")
-			return
-		end
-	end
-	local info = GetSpellInfoSafe(spellID)
-	local newAura = CreateDefaultAura(spellID)
-	table.insert(db.auras, newAura)
-	RefreshGrid()
-	UpdateDisplay()
-	Print("已添加 " .. ((info and info.name) or spellID) .. "。")
-end
-
-local CreateOptionsFrame
-
-local function GetCDMFrameSpellID(frame)
-	if not frame or not frame.cooldownID or not C_CooldownViewer then
-		return nil
-	end
-	local ok, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, frame.cooldownID)
-	if not ok or not info then
-		return nil
-	end
-	return info.overrideTooltipSpellID or info.overrideSpellID or info.spellID or info.spellId or info.overrideSpellId
-end
-
-local function FindAuraBySpellID(spellID)
-	for index, aura in ipairs(db.auras) do
-		if tonumber(aura.spellID) == tonumber(spellID) then
-			return index, aura
-		end
-	end
-end
-
-local function ShowCDMContextMenu(frame)
-	local spellID = GetCDMFrameSpellID(frame)
-	if not spellID or not MenuUtil or not MenuUtil.CreateContextMenu then
-		return
-	end
-	MenuUtil.CreateContextMenu(frame, function(_, rootDescription)
-		local index = FindAuraBySpellID(spellID)
-		local info = GetSpellInfoSafe(spellID)
-		local title = (info and info.name) or ("Spell " .. tostring(spellID))
-		rootDescription:CreateTitle(title)
-		if index then
-			rootDescription:CreateButton("Remove from NewStatusAuras", function()
-				table.remove(db.auras, index)
-				selectedKey = nil
-				RefreshGrid()
-				UpdateDisplay()
-			end)
-			rootDescription:CreateButton("Edit in NewStatusAuras", function()
-				selectedKey = index
-				OpenEdit(index)
-			end)
-		else
-			rootDescription:CreateButton("Assign to NewStatusAuras", function()
-				AddSpell(spellID)
-			end)
-		end
-		rootDescription:CreateButton("Open NewStatusAuras", function()
-			CreateOptionsFrame()
-			selectedKey = index or selectedKey
-			RefreshGrid()
-			optionsFrame:Show()
-		end)
-	end)
-end
-
-local function InstallCDMContextMenus()
-	for _, viewerName in ipairs(cdmViewers) do
-		local viewer = _G[viewerName]
-		if viewer and viewer.itemFramePool then
-			if not viewer.nsaDataHooked then
-				viewer.nsaDataHooked = true
-				if viewer.RefreshLayout then hooksecurefunc(viewer, "RefreshLayout", ResetCDMKeyCache) end
-				if viewer.RefreshData then hooksecurefunc(viewer, "RefreshData", ResetCDMKeyCache) end
-			end
-			local function hookFrame(_, frame)
-				if frame.nsaContextHooked then return end
-				frame.nsaContextHooked = true
-				local cooldown = frame.Cooldown or frame.cooldown
-				if cooldown and cooldown.SetCooldownFromDurationObject then
-					hooksecurefunc(cooldown, "SetCooldownFromDurationObject", function(_, durationObject)
-						frame.nsaDurationObject = durationObject
-					end)
-					if cooldown.SetCooldown then
-						hooksecurefunc(cooldown, "SetCooldown", function(_, startTime, duration, modRate)
-							frame.nsaCooldownStart = startTime
-							frame.nsaCooldownDuration = duration
-							frame.nsaCooldownModRate = modRate
-						end)
-					end
-					if cooldown.Clear then
-						hooksecurefunc(cooldown, "Clear", function()
-							frame.nsaDurationObject = nil
-							frame.nsaCooldownStart = nil
-							frame.nsaCooldownDuration = nil
-						end)
-					end
-				end
-				frame:HookScript("OnMouseUp", function(self, button)
-					if button == "RightButton" and not (InCombatLockdown and InCombatLockdown()) then
-						ShowCDMContextMenu(self)
-					end
-				end)
-			end
-			if viewer.OnAcquireItemFrame then
-				hooksecurefunc(viewer, "OnAcquireItemFrame", hookFrame)
-			end
-			for frame in viewer.itemFramePool:EnumerateActive() do
-				hookFrame(viewer, frame)
-			end
-		end
-	end
+	local input = CreateFrame("EditBox", nil, parent, "InputBoxTemplate"); input:SetSize(width, 22); input:SetPoint("TOPLEFT", x, y); input:SetAutoFocus(false); input:SetMaxLetters(32); input:SetText(tostring(value or "")); return input
 end
 
 local function CreateExportDialog(selectedOnly)
-	local dialog = CreateFrame("Frame", "NSAExportDialog", UIParent, "BackdropTemplate")
-	dialog:SetSize(560, 330)
-	dialog:SetPoint("CENTER")
-	dialog:SetFrameStrata("DIALOG")
-	AddBackdrop(dialog)
-	tinsert(UISpecialFrames, "NSAExportDialog")
-
-	local title = dialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	title:SetPoint("TOP", dialog, "TOP", 0, -12)
-	title:SetText("复制以下字符串：")
-	local edit = CreateFrame("EditBox", nil, dialog, "InputBoxTemplate")
-	edit:SetMultiLine(true)
-	edit:SetSize(520, 250)
-	edit:SetPoint("TOP", title, "BOTTOM", 0, -10)
-	edit:SetFont(STANDARD_TEXT_FONT, 11, "")
-	edit:SetText(ExportString(selectedOnly))
-	edit:HighlightText()
-	local close = CreateFrame("Button", nil, dialog, "UIPanelCloseButton")
-	close:SetPoint("TOPRIGHT", dialog, "TOPRIGHT", -4, -4)
-	close:SetScript("OnClick", function() dialog:Hide() end)
+	local dialog = CreateFrame("Frame", "NSAExportDialog", UIParent, "BackdropTemplate"); dialog:SetSize(560, 330); dialog:SetPoint("CENTER"); dialog:SetFrameStrata("DIALOG"); AddBackdrop(dialog); tinsert(UISpecialFrames, "NSAExportDialog")
+	local edit = CreateFrame("EditBox", nil, dialog, "InputBoxTemplate"); edit:SetMultiLine(true); edit:SetSize(520, 250); edit:SetPoint("TOP", 0, -30); edit:SetFont(STANDARD_TEXT_FONT, 11, ""); edit:SetText(ExportString(selectedOnly)); edit:HighlightText()
+	local close = CreateFrame("Button", nil, dialog, "UIPanelCloseButton"); close:SetPoint("TOPRIGHT", -4, -4); close:SetScript("OnClick", function() dialog:Hide() end)
 end
 
 local function CreateImportDialog()
-	local dialog = CreateFrame("Frame", "NSAImportDialog", UIParent, "BackdropTemplate")
-	dialog:SetSize(560, 330)
-	dialog:SetPoint("CENTER")
-	dialog:SetFrameStrata("DIALOG")
-	AddBackdrop(dialog)
-	tinsert(UISpecialFrames, "NSAImportDialog")
-
-	local title = dialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	title:SetPoint("TOP", dialog, "TOP", 0, -12)
-	title:SetText("粘贴字符串后点导入：")
-	local edit = CreateFrame("EditBox", nil, dialog, "InputBoxTemplate")
-	edit:SetMultiLine(true)
-	edit:SetSize(520, 235)
-	edit:SetPoint("TOP", title, "BOTTOM", 0, -10)
-	edit:SetFont(STANDARD_TEXT_FONT, 11, "")
-	local okButton = MakeButton(dialog, "导入", 80)
-	okButton:SetPoint("BOTTOM", dialog, "BOTTOM", 0, 12)
-	okButton:SetScript("OnClick", function()
-		local ok, message = ImportString(edit:GetText())
-		Print(message)
-		if ok then
-			RefreshGrid()
-			UpdateDisplay()
-			dialog:Hide()
-		end
-	end)
-	local close = CreateFrame("Button", nil, dialog, "UIPanelCloseButton")
-	close:SetPoint("TOPRIGHT", dialog, "TOPRIGHT", -4, -4)
-	close:SetScript("OnClick", function() dialog:Hide() end)
+	local dialog = CreateFrame("Frame", "NSAImportDialog", UIParent, "BackdropTemplate"); dialog:SetSize(560, 330); dialog:SetPoint("CENTER"); dialog:SetFrameStrata("DIALOG"); AddBackdrop(dialog); tinsert(UISpecialFrames, "NSAImportDialog")
+	local edit = CreateFrame("EditBox", nil, dialog, "InputBoxTemplate"); edit:SetMultiLine(true); edit:SetSize(520, 235); edit:SetPoint("TOP", 0, -30); edit:SetFont(STANDARD_TEXT_FONT, 11, "")
+	local button = MakeButton(dialog, "导入", 80); button:SetPoint("BOTTOM", 0, 12); button:SetScript("OnClick", function() local ok, message = ImportString(edit:GetText()); Print(message); if ok then SaveCurrentDatabase(); RefreshGrid(); UpdateDisplay(); dialog:Hide() end end)
+	local close = CreateFrame("Button", nil, dialog, "UIPanelCloseButton"); close:SetPoint("TOPRIGHT", -4, -4); close:SetScript("OnClick", function() dialog:Hide() end)
 end
 
-CreateOptionsFrame = function()
-	if optionsFrame then return end
-
-	local frame = CreateFrame("Frame", "NSAOptionsFrame", UIParent, "BackdropTemplate")
-	frame:SetSize(620, 535)
-	frame:SetPoint("CENTER")
-	frame:SetFrameStrata("DIALOG")
-	frame:SetMovable(true)
-	frame:EnableMouse(true)
-	frame:RegisterForDrag("LeftButton")
-	frame:SetScript("OnDragStart", frame.StartMoving)
-	frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
-	AddBackdrop(frame)
-	tinsert(UISpecialFrames, "NSAOptionsFrame")
-	optionsFrame = frame
-
-	local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-	title:SetPoint("TOP", frame, "TOP", 0, -14)
-	title:SetText("NEW STATUS AURAS")
-	local subtitle = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	subtitle:SetPoint("TOP", title, "BOTTOM", 0, -2)
-	subtitle:SetText("TGA 光环 · 暴雪追踪增益联动")
-	local versionInfo = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	versionInfo:SetPoint("TOP", subtitle, "BOTTOM", 0, -4)
-	versionInfo:SetWidth(580)
-	versionInfo:SetJustifyH("CENTER")
-	versionInfo:SetText("版本 1.4.2  |  游戏版本：正式服 12.1  |  插件：NewStatusAuras  |  作者：梅超風-白银之手")
-	versionInfo:SetTextColor(0.72, 0.72, 0.72)
-
-	local grid = CreateFrame("Frame", nil, frame)
-	grid:SetPoint("TOPLEFT", frame, "TOPLEFT", 20, -70)
-	grid:SetSize(570, 300)
-	frame.gridParent = grid
-
-	local newButton = MakeButton(frame, "新建", 80)
-	newButton:SetPoint("TOPLEFT", frame, "TOPLEFT", 20, -365)
-	newButton:SetScript("OnClick", function()
-		local newAura = CreateDefaultAura()
-		newAura.name = "光环" .. (#db.auras + 1)
-		table.insert(db.auras, newAura)
-		selectedKey = #db.auras
-		RefreshGrid()
-	end)
-
-	local deleteButton = MakeButton(frame, "删除", 80)
-	deleteButton:SetPoint("LEFT", newButton, "RIGHT", 6, 0)
-	deleteButton:SetScript("OnClick", function()
-		for index = #db.auras, 1, -1 do
-			if db.auras[index].selected or index == selectedKey then
-				table.remove(db.auras, index)
-			end
-		end
-		selectedKey = nil
-		RefreshGrid()
-		UpdateDisplay()
-	end)
-
-	local editButton = MakeButton(frame, "编辑", 80)
-	editButton:SetPoint("LEFT", deleteButton, "RIGHT", 6, 0)
-	editButton:SetScript("OnClick", function()
-		if selectedKey and db.auras[selectedKey] then
-			OpenEdit(selectedKey)
-		else
-			Print("先选择一个特效。")
-		end
-	end)
-	frame.openEdit = OpenEdit
-
-	local importButton = MakeButton(frame, "打开冷却管理", 145)
-	importButton:SetPoint("LEFT", editButton, "RIGHT", 6, 0)
-	importButton:SetScript("OnClick", OpenCooldownManager)
-
-	local selectAllButton = MakeButton(frame, "全选", 58)
-	selectAllButton:SetPoint("TOPLEFT", frame, "TOPLEFT", 20, -397)
-	selectAllButton:SetScript("OnClick", function()
-		for _, aura in ipairs(db.auras) do aura.selected = true end
-		RefreshGrid()
-	end)
-	local clearButton = MakeButton(frame, "清除选择", 75)
-	clearButton:SetPoint("LEFT", selectAllButton, "RIGHT", 6, 0)
-	clearButton:SetScript("OnClick", function()
-		for _, aura in ipairs(db.auras) do aura.selected = false end
-		RefreshGrid()
-	end)
-	local exportButton = MakeButton(frame, "导出所选", 80)
-	exportButton:SetPoint("LEFT", clearButton, "RIGHT", 6, 0)
-	exportButton:SetScript("OnClick", function() CreateExportDialog(true) end)
-	local importStringButton = MakeButton(frame, "导入", 65)
-	importStringButton:SetPoint("LEFT", exportButton, "RIGHT", 6, 0)
-	importStringButton:SetScript("OnClick", CreateImportDialog)
-	local testButton = MakeButton(frame, "测试光环", 80)
-	testButton:SetPoint("LEFT", importStringButton, "RIGHT", 6, 0)
-	testButton:SetScript("OnClick", function()
-		testMode = true
-		UpdateDisplay()
-		C_Timer.After(3, function()
-			testMode = false
-			UpdateDisplay()
-		end)
-	end)
-
-	local profileLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	profileLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 20, -432)
-	profileLabel:SetText("配置文件")
-	frame.profileDropdown = CreateFrame("Frame", "NSAProfileDropdown", frame, "UIDropDownMenuTemplate")
-	frame.profileDropdown:SetPoint("TOPLEFT", frame, "TOPLEFT", 72, -424)
-	UIDropDownMenu_SetWidth(frame.profileDropdown, 145)
-	frame.profileName = CreateTextEdit(frame, 235, -426, 115, "")
-	frame.profileName:SetMaxLetters(32)
-	local newProfile = MakeButton(frame, "新建配置", 82)
-	newProfile:SetPoint("LEFT", frame.profileName, "RIGHT", 6, 0)
-	newProfile:SetScript("OnClick", function()
-		local name = strtrim(frame.profileName:GetText() or "")
-		if name == "" then return end
-		rootDB.profiles[name] = CopyTable(db)
-		rootDB.profileKeys[currentCharacterKey] = name
-		db = rootDB.profiles[name]
-		EnsureDatabase()
-		RefreshGrid()
-		UpdateDisplay()
-	end)
-	UIDropDownMenu_Initialize(frame.profileDropdown, function()
-		for profileName in pairs(rootDB.profiles) do
-			local info = UIDropDownMenu_CreateInfo()
-			info.text = profileName
-			info.checked = (rootDB.profileKeys[currentCharacterKey] == profileName)
-			info.func = function()
-				rootDB.profileKeys[currentCharacterKey] = profileName
-				db = rootDB.profiles[profileName]
-				EnsureDatabase()
-				UIDropDownMenu_SetText(frame.profileDropdown, profileName)
-				RefreshGrid()
-				UpdateDisplay()
-			end
-			UIDropDownMenu_AddButton(info)
-		end
-	end)
-	UIDropDownMenu_SetText(frame.profileDropdown, rootDB.profileKeys[currentCharacterKey] or "默认")
+local function AddSpell(spellID)
+	spellID = tonumber(spellID); if not spellID or spellID <= 0 then Print("用法：/nsa add 法术ID"); return end
+	for _, aura in ipairs(db.auras) do if tonumber(aura.spellID) == spellID then Print("这个法术已经在列表中。"); return end end
+	table.insert(db.auras, CreateDefaultAura(spellID)); SaveCurrentDatabase(); RefreshGrid(); UpdateDisplay()
 end
 
-local profileFrame
-
-local function RefreshProfileDropdown(dropdown)
-	if not dropdown then return end
-	UIDropDownMenu_Initialize(dropdown, function()
-		for profileName in pairs(rootDB.profiles or {}) do
-			local info = UIDropDownMenu_CreateInfo()
-			info.text = profileName
-			info.checked = (rootDB.profileKeys[currentCharacterKey] == profileName)
-			info.func = function()
-				UIDropDownMenu_SetText(dropdown, profileName)
-				dropdown.selectedProfile = profileName
-			end
-			UIDropDownMenu_AddButton(info)
-		end
-	end)
-	UIDropDownMenu_SetText(dropdown, rootDB.profileKeys[currentCharacterKey] or currentClassKey or "默认")
+local function OpenCooldownManager()
+	if not CooldownViewerSettings and UIParentLoadAddOn then UIParentLoadAddOn("Blizzard_CooldownViewer") end
+	if CooldownViewerSettings and CooldownViewerSettings.TogglePanel then CooldownViewerSettings:TogglePanel(); return end
+	Print("冷却管理器尚未加载。")
 end
 
-local function ApplySelectedProfile(profileName)
-	if not profileName or not rootDB.profiles[profileName] then return end
-	rootDB.profileKeys[currentCharacterKey] = profileName
-	db = rootDB.profiles[profileName]
-	EnsureDatabase()
-	if optionsFrame and optionsFrame.profileDropdown then
-		UIDropDownMenu_SetText(optionsFrame.profileDropdown, profileName)
+local function ImportFromCooldownViewer()
+	if not C_CooldownViewer or not C_CooldownViewer.GetCooldownViewerCategorySet then Print("冷却管理器接口不可用。"); return end
+	local categories = Enum and Enum.CooldownViewerCategory and { Enum.CooldownViewerCategory.TrackedBar, Enum.CooldownViewerCategory.TrackedBuff } or { 3, 4 }
+	local existing, count = {}, 0
+	for _, aura in ipairs(db.auras) do existing[tonumber(aura.spellID)] = true end
+	for _, category in ipairs(categories) do local ok, ids = pcall(C_CooldownViewer.GetCooldownViewerCategorySet, category, true); if ok and ids then for _, id in ipairs(ids) do local good, info = pcall(C_CooldownViewer.GetCooldownViewerCooldownInfo, id); if good and info then local spellID = info.overrideTooltipSpellID or info.overrideSpellID or info.spellID or info.spellId or info.overrideSpellId; if spellID and not existing[spellID] then existing[spellID] = true; table.insert(db.auras, CreateDefaultAura(spellID)); count = count + 1 end end end end end
+	SaveCurrentDatabase(); RefreshGrid(); UpdateDisplay(); Print("已从冷却管理器导入 " .. count .. " 个法术。")
+end
+
+local function InstallCDMContextMenus()
+	for _, viewerName in ipairs({ "BuffBarCooldownViewer", "BuffIconCooldownViewer" }) do
+		local viewer = _G[viewerName]
+		if viewer and viewer.itemFramePool and viewer.itemFramePool.EnumerateActive then
+			for frame in viewer.itemFramePool:EnumerateActive() do
+				if not frame.nsaHooked then
+					frame.nsaHooked = true
+					local cooldown = frame.Cooldown or frame.cooldown
+					if cooldown and cooldown.SetCooldownFromDurationObject then hooksecurefunc(cooldown, "SetCooldownFromDurationObject", function(_, object) frame.nsaDurationObject = object end) end
+				end
+			end
+		end
 	end
-	RefreshGrid()
-	UpdateDisplay()
 end
 
 local function CreateProfileFrame()
-	if profileFrame then
-		RefreshProfileDropdown(profileFrame.dropdown)
-		profileFrame:Show()
-		return
-	end
-	local frame = CreateFrame("Frame", "NSAProfileFrame", UIParent, "BackdropTemplate")
-	frame:SetSize(560, 340)
-	frame:SetPoint("CENTER")
-	frame:SetFrameStrata("DIALOG")
-	frame:SetMovable(true)
-	frame:EnableMouse(true)
-	frame:RegisterForDrag("LeftButton")
-	frame:SetScript("OnDragStart", frame.StartMoving)
-	frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
-	AddBackdrop(frame)
-	tinsert(UISpecialFrames, "NSAProfileFrame")
-	profileFrame = frame
-
-	local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-	title:SetPoint("TOP", frame, "TOP", 0, -16)
-	title:SetText("NewStatusAuras 配置文件")
-	local description = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	description:SetPoint("TOPLEFT", frame, "TOPLEFT", 24, -56)
-	description:SetText("配置文件可以按角色或职业独立保存。")
-	local character = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	character:SetPoint("TOPLEFT", frame, "TOPLEFT", 24, -86)
-	character:SetText("当前角色：" .. tostring(currentCharacterKey) .. "    职业：" .. tostring(currentClassKey))
-
-	local profileLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	profileLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 24, -126)
-	profileLabel:SetText("当前配置：")
-	frame.dropdown = CreateFrame("Frame", "NSAStandaloneProfileDropdown", frame, "UIDropDownMenuTemplate")
-	frame.dropdown:SetPoint("TOPLEFT", frame, "TOPLEFT", 88, -118)
-	UIDropDownMenu_SetWidth(frame.dropdown, 190)
-	RefreshProfileDropdown(frame.dropdown)
-
-	local name = CreateFrame("EditBox", nil, frame, "InputBoxTemplate")
-	name:SetSize(180, 22)
-	name:SetPoint("TOPLEFT", frame, "TOPLEFT", 24, -178)
-	name:SetAutoFocus(false)
-	name:SetMaxLetters(32)
-	frame.name = name
-
-	local create = MakeButton(frame, "新建并复制当前", 125)
-	create:SetPoint("LEFT", name, "RIGHT", 8, 0)
-	create:SetScript("OnClick", function()
-		local newName = strtrim(name:GetText() or "")
-		if newName == "" then return end
-		rootDB.profiles[newName] = CopyTable(db)
-		ApplySelectedProfile(newName)
-		RefreshProfileDropdown(frame.dropdown)
-		name:SetText("")
-	end)
-
-	local classButton = MakeButton(frame, "使用当前职业配置", 125)
-	classButton:SetPoint("TOPLEFT", frame, "TOPLEFT", 24, -220)
-	classButton:SetScript("OnClick", function()
-		rootDB.profiles[currentClassKey] = rootDB.profiles[currentClassKey] or CopyTable(db)
-		rootDB.profiles[currentClassKey].profileType = "职业"
-		rootDB.profiles[currentClassKey].class = currentClassKey
-		ApplySelectedProfile(currentClassKey)
-		RefreshProfileDropdown(frame.dropdown)
-	end)
-
-	local apply = MakeButton(frame, "应用选中配置", 110)
-	apply:SetPoint("LEFT", classButton, "RIGHT", 8, 0)
-	apply:SetScript("OnClick", function()
-		ApplySelectedProfile(frame.dropdown.selectedProfile or rootDB.profileKeys[currentCharacterKey])
-	end)
-
-	local open = MakeButton(frame, "打开光环设置", 110)
-	open:SetPoint("TOPLEFT", frame, "TOPLEFT", 24, -264)
-	open:SetScript("OnClick", function()
-		CreateOptionsFrame()
-		RefreshGrid()
-		optionsFrame:Show()
-	end)
-
-	local byline = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	byline:SetPoint("BOTTOM", frame, "BOTTOM", 0, 18)
-	byline:SetText("(by：梅超風-白银之手)")
-	byline:SetTextColor(0.7, 0.7, 0.7)
+	local frame = CreateFrame("Frame", "NSAProfileFrame", UIParent, "BackdropTemplate"); frame:SetSize(560, 300); frame:SetPoint("CENTER"); frame:SetFrameStrata("DIALOG"); frame:SetMovable(true); frame:EnableMouse(true); frame:RegisterForDrag("LeftButton"); frame:SetScript("OnDragStart", frame.StartMoving); frame:SetScript("OnDragStop", frame.StopMovingOrSizing); AddBackdrop(frame); tinsert(UISpecialFrames, "NSAProfileFrame")
+	local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge"); title:SetPoint("TOP", 0, -16); title:SetText("角色 / 职业配置")
+	local dropdown = CreateFrame("Frame", "NSAProfileDropdown", frame, "UIDropDownMenuTemplate"); dropdown:SetPoint("TOPLEFT", 20, -60); UIDropDownMenu_SetWidth(dropdown, 190)
+	local name = CreateTextEdit(frame, 24, -120, 180, "")
+	local function Refresh() local profileName = db.class or select(2, UnitClass("player")) or "DEFAULT"; UIDropDownMenu_Initialize(dropdown, function() local info = UIDropDownMenu_CreateInfo(); info.text = profileName .. "（当前职业）"; info.checked = true; info.func = function() UIDropDownMenu_SetText(dropdown, profileName .. "（当前职业）") end; UIDropDownMenu_AddButton(info) end); UIDropDownMenu_SetText(dropdown, profileName .. "（当前职业）") end
+	Refresh()
+	local create = MakeButton(frame, "新建配置", 120); create:SetPoint("LEFT", name, "RIGHT", 8, 0); create:SetScript("OnClick", function() SaveCurrentDatabase(); Refresh(); RefreshGrid(); UpdateDisplay() end); name:Hide(); create:Hide()
+	local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton"); close:SetPoint("TOPRIGHT", -4, -4); close:SetScript("OnClick", function() frame:Hide() end)
 	frame:Show()
 end
 
-local function RegisterAddonSettings()
-	if NewStatusAurasSettingsCategory then return end
-	local panel = CreateFrame("Frame", "NewStatusAurasSettingsPanel")
-	panel.name = "NewStatusAuras"
-	panel:HookScript("OnShow", function(self)
-		if self._built then return end
-		self._built = true
-		local title = self:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-		title:SetPoint("TOPLEFT", 24, -24)
-		title:SetText("NEW STATUS AURAS")
-		local meta = self:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-		meta:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -12)
-		local getMeta = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
-		local version = getMeta and getMeta(ADDON_NAME, "Version") or "1.4.2"
-		local interface = getMeta and getMeta(ADDON_NAME, "X-Interface") or "120105"
-		local modified = getMeta and getMeta(ADDON_NAME, "X-Last-Modified") or "2026-09-29"
-		meta:SetText("版本：" .. tostring(version) .. "    游戏版本：正式服 12.1（" .. tostring(interface) .. "）\n最后修改：" .. tostring(modified) .. "\n插件：NewStatusAuras\n作者：梅超風-白银之手")
-		local note = self:CreateFontString(nil, "ARTWORK", "GameFontDisable")
-		note:SetPoint("TOPLEFT", meta, "BOTTOMLEFT", 0, -18)
-		note:SetText("TGA 光环显示与暴雪冷却管理器追踪增益联动")
-		local open = CreateFrame("Button", nil, self, "UIPanelButtonTemplate")
-		open:SetSize(150, 24)
-		open:SetPoint("TOPLEFT", note, "BOTTOMLEFT", 0, -18)
-		open:SetText("打开光环设置")
-		open:SetScript("OnClick", function()
-			CreateOptionsFrame()
-			RefreshGrid()
-			optionsFrame:Show()
-		end)
-		local profiles = CreateFrame("Button", nil, self, "UIPanelButtonTemplate")
-		profiles:SetSize(150, 24)
-		profiles:SetPoint("LEFT", open, "RIGHT", 8, 0)
-		profiles:SetText("配置文件")
-		profiles:SetScript("OnClick", CreateProfileFrame)
-		local byline = self:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-		byline:SetPoint("BOTTOMLEFT", 24, 24)
-		byline:SetText("(by：梅超風-白银之手)")
-	end)
-	if Settings and Settings.RegisterCanvasLayoutCategory then
-		local category = Settings.RegisterCanvasLayoutCategory(panel, panel.name)
-		Settings.RegisterAddOnCategory(category)
-		NewStatusAurasSettingsCategory = category
-	elseif InterfaceOptions_AddCategory then
-		InterfaceOptions_AddCategory(panel)
-		NewStatusAurasSettingsCategory = panel
-	end
+local function CreateOptionsFrame()
+	if optionsFrame then optionsFrame:Show(); RefreshGrid(); return end
+	local frame = CreateFrame("Frame", "NSAOptionsFrame", UIParent, "BackdropTemplate"); frame:SetSize(620, 535); frame:SetPoint("CENTER"); frame:SetFrameStrata("DIALOG"); frame:SetMovable(true); frame:EnableMouse(true); frame:RegisterForDrag("LeftButton"); frame:SetScript("OnDragStart", frame.StartMoving); frame:SetScript("OnDragStop", frame.StopMovingOrSizing); AddBackdrop(frame); tinsert(UISpecialFrames, "NSAOptionsFrame"); optionsFrame = frame
+	local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge"); title:SetPoint("TOP", 0, -14); title:SetText("新状态光环")
+	local info = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall"); info:SetPoint("TOP", title, "BOTTOM", 0, -4); info:SetText("版本 " .. ADDON_VERSION .. " | 魔兽世界 12.1 | 作者：梅超風-白银之手")
+	local grid = CreateFrame("Frame", nil, frame); grid:SetPoint("TOPLEFT", 20, -62); grid:SetSize(570, 300); frame.grid = grid
+	local newButton = MakeButton(frame, "新建", 70); newButton:SetPoint("TOPLEFT", 20, -365); newButton:SetScript("OnClick", function() local aura = CreateDefaultAura(); aura.name = MakeUniqueAuraName("光环"); table.insert(db.auras, aura); selectedKey = #db.auras; SaveCurrentDatabase(); RefreshGrid(); OpenEdit(selectedKey) end)
+	local deleteButton = MakeButton(frame, "删除", 70); deleteButton:SetPoint("LEFT", newButton, "RIGHT", 6, 0); deleteButton:SetScript("OnClick", function() for index = #db.auras, 1, -1 do if db.auras[index].selected or index == selectedKey then table.remove(db.auras, index) end end; selectedKey = nil; SaveCurrentDatabase(); RefreshGrid(); UpdateDisplay() end)
+	local editButton = MakeButton(frame, "编辑", 70); editButton:SetPoint("LEFT", deleteButton, "RIGHT", 6, 0); editButton:SetScript("OnClick", function() if selectedKey then OpenEdit(selectedKey) end end); frame.openEdit = OpenEdit
+	local cdmButton = MakeButton(frame, "打开冷却管理", 150); cdmButton:SetPoint("LEFT", editButton, "RIGHT", 6, 0); cdmButton:SetScript("OnClick", OpenCooldownManager)
+	local allButton = MakeButton(frame, "全选", 75); allButton:SetPoint("TOPLEFT", 20, -397); allButton:SetScript("OnClick", function() for _, aura in ipairs(db.auras) do aura.selected = true end; RefreshGrid() end)
+	local clearButton = MakeButton(frame, "清除选择", 60); clearButton:SetPoint("LEFT", allButton, "RIGHT", 6, 0); clearButton:SetScript("OnClick", function() for _, aura in ipairs(db.auras) do aura.selected = false end; RefreshGrid() end)
+	local exportButton = MakeButton(frame, "导出全部", 82); exportButton:SetPoint("LEFT", clearButton, "RIGHT", 6, 0); exportButton:SetScript("OnClick", function() CreateExportDialog(false) end)
+	local importButton = MakeButton(frame, "导入", 70); importButton:SetPoint("LEFT", exportButton, "RIGHT", 6, 0); importButton:SetScript("OnClick", CreateImportDialog)
+	local profileButton = MakeButton(frame, "配置", 80); profileButton:SetPoint("LEFT", importButton, "RIGHT", 6, 0); profileButton:SetScript("OnClick", CreateProfileFrame)
+	local testButton = MakeButton(frame, "测试", 60); testButton:SetPoint("LEFT", profileButton, "RIGHT", 6, 0); testButton:SetScript("OnClick", function() testMode = true; previewing = false; UpdateDisplay(); C_Timer.After(3, function() testMode = false; UpdateDisplay() end) end)
+	frame:Show(); RefreshGrid()
 end
 
--- ---------------------------------------------------------------------------
--- 初始化与命令
--- ---------------------------------------------------------------------------
-local eventFrame = CreateFrame("Frame")
-eventFrame:RegisterEvent("PLAYER_LOGIN")
-eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
-eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
-eventFrame:RegisterUnitEvent("UNIT_AURA", "player")
-eventFrame:RegisterEvent("ADDON_LOADED")
-eventFrame:RegisterEvent("COOLDOWN_VIEWER_DATA_LOADED")
-eventFrame:RegisterEvent("COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED")
-eventFrame:SetScript("OnEvent", function(self, event, ...)
-	if event == "ADDON_LOADED" then
-		local loadedName = select(1, ...)
-		if loadedName == "Blizzard_CooldownViewer" then
-			ResetCDMKeyCache()
-			HideBlizzardTrackedBars()
-			InstallCDMContextMenus()
+local function RegisterSettings()
+	if NewStatusAurasSettingsCategory then return end
+	local panel = CreateFrame("Frame", "NewStatusAurasSettingsPanel"); panel.name = "新状态光环"; panel:HookScript("OnShow", function(self) if self.built then return end; self.built = true; local title = self:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge"); title:SetPoint("TOPLEFT", 24, -24); title:SetText("新状态光环"); local meta = self:CreateFontString(nil, "ARTWORK", "GameFontHighlight"); meta:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -12); meta:SetText("版本 " .. ADDON_VERSION .. " | 游戏版本 12.1\n作者：梅超風-白银之手"); local open = CreateFrame("Button", nil, self, "UIPanelButtonTemplate"); open:SetSize(160, 24); open:SetPoint("TOPLEFT", meta, "BOTTOMLEFT", 0, -20); open:SetText("打开设置"); open:SetScript("OnClick", function() CreateOptionsFrame() end); local profiles = CreateFrame("Button", nil, self, "UIPanelButtonTemplate"); profiles:SetSize(160, 24); profiles:SetPoint("LEFT", open, "RIGHT", 8, 0); profiles:SetText("职业配置"); profiles:SetScript("OnClick", CreateProfileFrame) end)
+	if Settings and Settings.RegisterCanvasLayoutCategory then local category = Settings.RegisterCanvasLayoutCategory(panel, panel.name); Settings.RegisterAddOnCategory(category); NewStatusAurasSettingsCategory = category elseif InterfaceOptions_AddCategory then InterfaceOptions_AddCategory(panel); NewStatusAurasSettingsCategory = panel end
+end
+
+local events = CreateFrame("Frame")
+	events:RegisterEvent("PLAYER_LOGIN"); events:RegisterEvent("PLAYER_LOGOUT"); events:RegisterEvent("PLAYER_ENTERING_WORLD"); events:RegisterEvent("PLAYER_REGEN_ENABLED"); events:RegisterUnitEvent("UNIT_AURA", "player"); events:RegisterEvent("ADDON_LOADED"); events:RegisterEvent("COOLDOWN_VIEWER_DATA_LOADED"); events:RegisterEvent("COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED")
+	events:SetScript("OnEvent", function(_, event, addonName)
+		if event == "ADDON_LOADED" then
+			if addonName == "NewStatusAuras" then
+				rootDB = NewStatusAurasDB or {}
+				rootDB.profiles = rootDB.profiles or {}
+				rootDB.profileKeys = rootDB.profileKeys or {}
+				LOAD_INJECT_PROFILES, LOAD_INJECT_AURAS, LOAD_INJECT_GLOBAL_AURAS = 0, 0, 0
+				for _, p in pairs(rootDB.profiles) do
+					if type(p) == "table" and type(p.auras) == "table" then
+						LOAD_INJECT_PROFILES = LOAD_INJECT_PROFILES + 1
+						for _ in pairs(p.auras) do LOAD_INJECT_AURAS = LOAD_INJECT_AURAS + 1 end
+					end
+				end
+				LOAD_INJECT_GLOBAL_AURAS = type(rootDB.auras) == "table" and #rootDB.auras or 0
+			elseif addonName == "Blizzard_CooldownViewer" then ResetCDMCache(); InstallCDMContextMenus() end
 		end
-		return
-	end
-	if event == "PLAYER_LOGIN" then
-		SelectProfileDatabase()
-		EnsureDatabase()
-		RegisterAddonSettings()
-		InstallCDMContextMenus()
-		Print("加载完成，共 " .. #db.auras .. " 个特效。输入 /nsa 打开设置。")
-	end
-	if event == "COOLDOWN_VIEWER_DATA_LOADED" or event == "COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED" then
-		ResetCDMKeyCache()
-		InstallCDMContextMenus()
-	end
-	if event == "PLAYER_REGEN_ENABLED" and nativeAuraRebuildPending then
-		RebuildNativeAuraContainers()
-	end
-	UpdateDisplay()
-end)
+		if event == "PLAYER_LOGIN" then
+			-- 关键：始终在注入完成后重新连接 SavedVariables，防止文件顶部捕获到空表
+			rootDB = NewStatusAurasDB or rootDB or {}
+			rootDB.profiles = rootDB.profiles or {}
+			rootDB.profileKeys = rootDB.profileKeys or {}
+			SelectProfileDatabase(); EnsureDatabase(); RecoverNonEmptyProfile(); EnsureDatabase(); RegisterSettings(); InstallCDMContextMenus()
+			C_Timer.After(0.5, ReportLoadedProfile)
+		elseif event == "PLAYER_ENTERING_WORLD" then
+			C_Timer.After(0, RefreshLoadedProfile)
+			C_Timer.After(1, ReportLoadedProfile)
+		elseif event == "PLAYER_LOGOUT" then SaveCurrentDatabase() end
+		if event == "PLAYER_REGEN_ENABLED" and rebuildPending then RebuildNative() end
+		if event == "COOLDOWN_VIEWER_DATA_LOADED" or event == "COOLDOWN_VIEWER_SPELL_OVERRIDE_UPDATED" then ResetCDMCache(); InstallCDMContextMenus() end
+		UpdateDisplay()
+	end)
+events:SetScript("OnUpdate", function(_, elapsed) events.elapsed = (events.elapsed or 0) + elapsed; if events.elapsed >= 0.08 then events.elapsed = 0; UpdateDisplay() end end)
 
-eventFrame:SetScript("OnUpdate", function(self, elapsed)
-	updateElapsed = updateElapsed + elapsed
-	if updateElapsed < UPDATE_INTERVAL then
-		return
-	end
-	updateElapsed = 0
-	UpdateDisplay()
-end)
-
-SLASH_NEWSTATUSAURAS1 = "/nsa"
-SLASH_NEWSTATUSAURAS2 = "/newstatusauras"
+SLASH_NEWSTATUSAURAS1 = "/nsa"; SLASH_NEWSTATUSAURAS2 = "/newstatusauras"
 SlashCmdList.NEWSTATUSAURAS = function(message)
 	local command = strlower(strtrim(message or ""))
-	if command == "import" then
-		ImportFromCooldownViewer()
-	elseif command == "cdm" then
-		OpenCooldownManager()
-	elseif command == "profiles" then
-		CreateProfileFrame()
-	elseif command:match("^add%s+") then
-		AddSpell(command:match("^add%s+(.+)$"))
-	elseif command == "test" then
-		testMode = true
-		UpdateDisplay()
-		C_Timer.After(3, function()
-			testMode = false
-			UpdateDisplay()
-		end)
-	else
-		CreateOptionsFrame()
-		selectedKey = selectedKey or (#db.auras > 0 and 1 or nil)
-		RefreshGrid()
-		optionsFrame:Show()
-	end
+	if command == "import" then ImportFromCooldownViewer() elseif command == "cdm" then OpenCooldownManager() elseif command == "profiles" then CreateProfileFrame() elseif command == "save" then SaveCurrentDatabase(); Print("已保存职业配置：" .. tostring(db and db.profileName or "默认") .. "，光环数量：" .. tostring(CountAuras(db))) elseif command:match("^add%s+") then AddSpell(command:match("^add%s+(.+)$")) elseif command == "test" then testMode = true; UpdateDisplay(); C_Timer.After(3, function() testMode = false; UpdateDisplay() end) elseif command == "debug" then
+		local charKey = (UnitName("player") or "?") .. "-" .. (GetRealmName and GetRealmName() or "?")
+		local classKey = select(2, UnitClass("player")) or "?"
+		Print("=== NSA 诊断 ===")
+		Print("加载注入: profiles="..LOAD_INJECT_PROFILES.." 光环="..LOAD_INJECT_AURAS.." 旧全局auras="..LOAD_INJECT_GLOBAL_AURAS)
+		Print("角色="..charKey.." 职业="..classKey)
+		Print("db 引用正确="..tostring(db == (rootDB.profiles and rootDB.profiles[classKey])).." db.profileName="..tostring(db and db.profileName))
+		Print("当前职业光环数="..tostring(db and CountAuras(db)))
+		local profileCount, auraTotal = 0, 0
+		for name, p in pairs(rootDB.profiles or {}) do
+			local n = type(p) == "table" and CountAuras(p) or 0
+			auraTotal = auraTotal + n; profileCount = profileCount + 1
+			Print("  profile["..tostring(name).."] 光环="..tostring(n))
+		end
+		Print("profiles 数量="..tostring(profileCount).." 光环合计="..tostring(auraTotal))
+		Print("profileKeys["..tostring(charKey).."]="..tostring(rootDB.profileKeys and rootDB.profileKeys[charKey] or "无"))
+		Print("legacyMigrated="..tostring(rootDB.legacyMigrated and true or false).." 旧全局auras数="..tostring(type(rootDB.auras) == "table" and #rootDB.auras or 0))
+	else CreateOptionsFrame() end
 end
